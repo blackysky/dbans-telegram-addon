@@ -1,0 +1,10 @@
+name: dbans-telegram-addon
+description: $description
+version: '${version}'
+
+main: de.silke.dbans.telegram.Main
+api-version: '1.21'
+load: STARTUP
+
+authors: [ Silke ]
+website: github.com/blackysky
