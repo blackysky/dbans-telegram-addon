@@ -24,7 +24,7 @@ import java.util.logging.Logger;
 @RequiredArgsConstructor
 public class TelegramClient {
 
-    private static final Logger log = Logger.getLogger("dbans-telegram-addon.TelegramClient");
+    private static final Logger log = Logger.getLogger("dbans-telegram-addon");
     private static final int MAX_RETRIES = 3;
 
     private final TelegramConfig config;

@@ -12,7 +12,7 @@ import java.util.logging.Logger;
 @Getter
 public class TelegramConfig {
 
-    private static final Logger log = Logger.getLogger("dbans-telegram-addon.TelegramConfig");
+    private static final Logger log = Logger.getLogger("dbans-telegram-addon");
 
     private final String token;
     private final List<String> chatIds;
