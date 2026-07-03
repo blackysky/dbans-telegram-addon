@@ -14,7 +14,7 @@ public enum SupportedLocale {
     RU("ru"),
     DE("de");
 
-    private static final Logger log = Logger.getLogger("dbans-telegram-addon.SupportedLocale");
+    private static final Logger log = Logger.getLogger("dbans-telegram-addon");
 
     private final String code;
 
