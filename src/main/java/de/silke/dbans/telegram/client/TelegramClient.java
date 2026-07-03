@@ -48,30 +48,38 @@ public class TelegramClient {
 
     @SuppressWarnings("UnusedReturnValue")
     public @NotNull CompletableFuture<Void> sendMessage(@NotNull String text) {
-        return sendMessage(text, 0);
+        return CompletableFuture.allOf(
+                config.getChatIds().stream()
+                      .map(chatId -> sendMessage(chatId, text, 0))
+                      .toArray(CompletableFuture[]::new)
+        );
     }
 
-    private @NotNull CompletableFuture<Void> sendMessage(@NotNull String text, int attempt) {
+    private @NotNull CompletableFuture<Void> sendMessage(@NotNull String chatId, @NotNull String text, int attempt) {
         String url = "https://api.telegram.org/bot" + config.getToken() + "/sendMessage";
-        String body = "chat_id=" + URLEncoder.encode(config.getChatId(), StandardCharsets.UTF_8)
+        String body = "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
                       + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8);
 
         HttpRequest request = HttpRequest.newBuilder()
                                          .uri(URI.create(url))
                                          .header("Content-Type", "application/x-www-form-urlencoded")
                                          .timeout(Duration.ofSeconds(10))
-                                         .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                                         .POST(HttpRequest.BodyPublishers.ofString(
+                                                 body,
+                                                 StandardCharsets.UTF_8
+                                         ))
                                          .build();
 
         return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                         .thenCompose(response -> handleResponse(text, response, attempt))
+                         .thenCompose(response -> handleResponse(chatId, text, response, attempt))
                          .exceptionally(ex -> {
-                             log.log(Level.SEVERE, "Failed to send Telegram message", ex);
+                             log.log(Level.SEVERE, "Failed to send Telegram message to " + chatId, ex);
                              return null;
                          });
     }
 
     private @NotNull CompletableFuture<Void> handleResponse(
+            @NotNull String chatId,
             @NotNull String text,
             @NotNull HttpResponse<String> response,
             int attempt
@@ -79,16 +87,16 @@ public class TelegramClient {
         int status = response.statusCode();
         if (status == 429) {
             if (attempt >= MAX_RETRIES) {
-                log.warning("Telegram rate limit hit; message dropped after " + MAX_RETRIES + " retries");
+                log.warning("Telegram rate limit hit; message to " + chatId + " dropped after " + MAX_RETRIES + " retries");
                 return CompletableFuture.completedFuture(null);
             }
             int retryAfter = parseRetryAfterSeconds(response.body());
-            log.warning("Telegram rate limit (retry_after=" + retryAfter + "s); retrying in "
-                        + retryAfter + "s (attempt " + (attempt + 1) + "/" + MAX_RETRIES + ").");
+            log.warning("Telegram rate limit for " + chatId + " (retry_after=" + retryAfter + "s); retrying in "
+                        + retryAfter + "s (attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
 
             CompletableFuture<Void> future = new CompletableFuture<>();
             scheduler.schedule(
-                    () -> sendMessage(text, attempt + 1)
+                    () -> sendMessage(chatId, text, attempt + 1)
                             .whenComplete((v, ex) -> {
                                 if (ex != null) {
                                     future.completeExceptionally(ex);
@@ -102,7 +110,7 @@ public class TelegramClient {
         } else if (status == 200) {
             return CompletableFuture.completedFuture(null);
         } else {
-            log.warning("Telegram API returned unexpected status " + status + ": " + response.body());
+            log.warning("Telegram API returned unexpected status " + status + " for " + chatId + ": " + response.body());
             return CompletableFuture.completedFuture(null);
         }
     }

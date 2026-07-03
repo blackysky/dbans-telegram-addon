@@ -6,6 +6,7 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.jetbrains.annotations.NotNull;
 
 import java.time.ZoneId;
+import java.util.List;
 import java.util.logging.Logger;
 
 @Getter
@@ -14,7 +15,7 @@ public class TelegramConfig {
     private static final Logger log = Logger.getLogger("dbans-telegram-addon.TelegramConfig");
 
     private final String token;
-    private final String chatId;
+    private final List<String> chatIds;
     private final SupportedLocale locale;
     private final ZoneId timezone;
     private final boolean notifyOnCreate;
@@ -24,7 +25,10 @@ public class TelegramConfig {
 
     public TelegramConfig(@NotNull FileConfiguration config) {
         this.token = config.getString("client.token", "").trim();
-        this.chatId = config.getString("client.chat-id", "").trim();
+        this.chatIds = config.getStringList("client.chat-ids").stream()
+                             .map(String::trim)
+                             .filter(id -> !id.isBlank())
+                             .toList();
         this.locale = SupportedLocale.fromCode(config.getString("locale", "en"));
         this.timezone = parseZone(config.getString("timezone", "UTC"));
         this.notifyOnCreate = config.getBoolean("notifications.on-create", true);
@@ -58,6 +62,8 @@ public class TelegramConfig {
     }
 
     public boolean isValid() {
-        return !token.isBlank() && isValidChatId(chatId);
+        return !token.isBlank()
+               && !chatIds.isEmpty()
+               && chatIds.stream().allMatch(TelegramConfig::isValidChatId);
     }
 }
