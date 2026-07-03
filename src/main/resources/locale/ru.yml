@@ -1,0 +1,27 @@
+permanent: "навсегда"
+
+types:
+  BAN: "Бан"
+  IP_BAN: "IP-Бан"
+  MUTE: "Мут"
+  KICK: "Кик"
+  JAIL: "Тюрьма"
+  WARNING: "Предупреждение"
+
+punishment-create: |
+  [{type}] {player} в `{server}`
+  от {issuer}
+  «{reason}»
+  до {expires}
+
+punishment-revoke: |
+  [СНЯТО] {type} - {player} - {server}
+  снял {revoker}
+  «{revocation_reason}»
+
+punishment-modify: |
+  [ИЗМЕНЕНО] {type} - {player} - {server}
+  причина: {old_reason} -> {new_reason}
+  до: {old_expires} -> {new_expires}
+
+punishment-expire: "[ИСТЕКЛО] {type} - {player} - {server}"

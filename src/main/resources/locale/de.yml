@@ -1,0 +1,27 @@
+permanent: "dauerhaft"
+
+types:
+  BAN: "Bann"
+  IP_BAN: "IP-Bann"
+  MUTE: "Stummschaltung"
+  KICK: "Kick"
+  JAIL: "Jail"
+  WARNING: "Verwarnung"
+
+punishment-create: |
+  [{type}] {player} - {server}
+  von {issuer}
+  «{reason}»
+  bis {expires}
+
+punishment-revoke: |
+  [AUFGEHOBEN] {type} - {player} - {server}
+  von {revoker}
+  «{revocation_reason}»
+
+punishment-modify: |
+  [GEÄNDERT] {type} - {player} - {server}
+  Grund: {old_reason} -> {new_reason}
+  bis: {old_expires} -> {new_expires}
+
+punishment-expire: "[ABGELAUFEN] {type} - {player} - {server}"
