@@ -24,7 +24,7 @@ public class NotificationService {
     public NotificationService(TelegramClient client, MessageProvider messageProvider, ZoneId timezone) {
         this.client = client;
         this.messageProvider = messageProvider;
-        this.dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm z").withZone(timezone);
+        this.dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z").withZone(timezone);
     }
 
     public void notify(@NotNull PunishmentCreateEvent event) {
