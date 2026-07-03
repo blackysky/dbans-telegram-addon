@@ -8,6 +8,8 @@ import de.silke.dbans.telegram.locale.MessageProvider;
 import de.silke.dbans.telegram.locale.SupportedLocale;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.File;
+
 import java.util.logging.Logger;
 
 public final class Main extends JavaPlugin {
@@ -19,7 +21,10 @@ public final class Main extends JavaPlugin {
     public void onEnable() {
         saveDefaultConfig();
         for (SupportedLocale locale : SupportedLocale.values()) {
-            saveResource("locale/" + locale.getCode() + ".yml", false);
+            String path = "locale/" + locale.getCode() + ".yml";
+            if (!new File(getDataFolder(), path).exists()) {
+                saveResource(path, false);
+            }
         }
 
         TelegramConfig telegramConfig = new TelegramConfig(getConfig());
