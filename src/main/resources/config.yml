@@ -1,0 +1,12 @@
+client:
+  token: ""
+  chat-id: ""
+
+locale: en
+timezone: UTC
+
+notifications:
+  on-create: true
+  on-revoke: true
+  on-modify: true
+  on-expire: true
