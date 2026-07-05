@@ -10,3 +10,4 @@ notifications:
   on-revoke: true
   on-modify: true
   on-expire: true
+  ignored-types: [ ]

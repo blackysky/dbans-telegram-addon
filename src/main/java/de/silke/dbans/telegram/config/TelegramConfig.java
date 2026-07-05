@@ -2,11 +2,14 @@ package de.silke.dbans.telegram.config;
 
 import de.silke.dbans.telegram.locale.SupportedLocale;
 import lombok.Getter;
+import me.demro.dlibs.dbans.api.punishment.PunishmentType;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.jetbrains.annotations.NotNull;
 
 import java.time.ZoneId;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.logging.Logger;
 
 @Getter
@@ -22,6 +25,7 @@ public class TelegramConfig {
     private final boolean notifyOnRevoke;
     private final boolean notifyOnModify;
     private final boolean notifyOnExpire;
+    private final Set<PunishmentType> ignoredTypes;
 
     public TelegramConfig(@NotNull FileConfiguration config) {
         this.token = config.getString("client.token", "").trim();
@@ -35,6 +39,19 @@ public class TelegramConfig {
         this.notifyOnRevoke = config.getBoolean("notifications.on-revoke", true);
         this.notifyOnModify = config.getBoolean("notifications.on-modify", true);
         this.notifyOnExpire = config.getBoolean("notifications.on-expire", true);
+        this.ignoredTypes = parseIgnoredTypes(config.getStringList("notifications.ignored-types"));
+    }
+
+    private static @NotNull Set<PunishmentType> parseIgnoredTypes(@NotNull List<String> raw) {
+        Set<PunishmentType> types = EnumSet.noneOf(PunishmentType.class);
+        for (String name : raw) {
+            try {
+                types.add(PunishmentType.valueOf(name.trim().toUpperCase()));
+            } catch (IllegalArgumentException e) {
+                log.warning("Unknown punishment type in notifications.ignored-types: " + name);
+            }
+        }
+        return types;
     }
 
     private static @NotNull ZoneId parseZone(String id) {
