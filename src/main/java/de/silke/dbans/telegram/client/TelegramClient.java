@@ -4,7 +4,6 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import de.silke.dbans.telegram.config.TelegramConfig;
-import lombok.RequiredArgsConstructor;
 import org.jetbrains.annotations.NotNull;
 
 import java.net.URI;
@@ -14,24 +13,34 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-@RequiredArgsConstructor
 public class TelegramClient {
 
     private static final Logger log = Logger.getLogger("dbans-telegram-addon");
+    private static final String DEFAULT_API_BASE_URL = "https://api.telegram.org";
     private static final int MAX_RETRIES = 3;
+    private static final Duration MIN_SEND_INTERVAL = Duration.ofSeconds(1);
 
     private final TelegramConfig config;
+    private final String apiBaseUrl;
     private final HttpClient httpClient = HttpClient.newBuilder()
                                                     .connectTimeout(Duration.ofSeconds(5))
                                                     .build();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final Map<String, CompletableFuture<Void>> chatQueues = new ConcurrentHashMap<>();
+
+    public TelegramClient(@NotNull TelegramConfig config) {
+        this(config, DEFAULT_API_BASE_URL);
+    }
+
+    TelegramClient(@NotNull TelegramConfig config, @NotNull String apiBaseUrl) {
+        this.config = config;
+        this.apiBaseUrl = apiBaseUrl;
+    }
 
     private static int parseRetryAfterSeconds(@NotNull String body) {
         try {
@@ -50,13 +59,33 @@ public class TelegramClient {
     public @NotNull CompletableFuture<Void> sendMessage(@NotNull String text) {
         return CompletableFuture.allOf(
                 config.getChatIds().stream()
-                      .map(chatId -> sendMessage(chatId, text, 0))
+                      .map(chatId -> enqueue(chatId, text))
                       .toArray(CompletableFuture[]::new)
         );
     }
 
+    private @NotNull CompletableFuture<Void> enqueue(@NotNull String chatId, @NotNull String text) {
+        return chatQueues.compute(chatId, (id, previous) -> {
+            CompletableFuture<Void> previousOrDone = previous != null ? previous : CompletableFuture.completedFuture(null);
+            return previousOrDone.thenCompose(v -> pacedSend(id, text));
+        });
+    }
+
+    private @NotNull CompletableFuture<Void> pacedSend(@NotNull String chatId, @NotNull String text) {
+        return sendMessage(chatId, text, 0).thenCombine(delay(), (v, w) -> null);
+    }
+
+    private @NotNull CompletableFuture<Void> delay() {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        scheduler.schedule(() -> future.complete(null),
+                           TelegramClient.MIN_SEND_INTERVAL.toMillis(),
+                           TimeUnit.MILLISECONDS
+        );
+        return future;
+    }
+
     private @NotNull CompletableFuture<Void> sendMessage(@NotNull String chatId, @NotNull String text, int attempt) {
-        String url = "https://api.telegram.org/bot" + config.getToken() + "/sendMessage";
+        String url = apiBaseUrl + "/bot" + config.getToken() + "/sendMessage";
         String body = "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
                       + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8);
 

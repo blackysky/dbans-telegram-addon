@@ -10,3 +10,10 @@ authors: [ Silke ]
 website: github.com/blackysky
 
 depend: [ dBans ]
+
+commands:
+  dbanstelegram:
+    description: Manage the dBans Telegram addon
+    usage: /<command> <reload|test>
+    permission: dbanstelegram.reload
+    permission-message: You don't have permission to do that.
