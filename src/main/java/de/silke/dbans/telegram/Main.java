@@ -2,20 +2,38 @@ package de.silke.dbans.telegram;
 
 import de.silke.dbans.telegram.application.NotificationService;
 import de.silke.dbans.telegram.client.TelegramClient;
+import de.silke.dbans.telegram.command.TelegramCommand;
 import de.silke.dbans.telegram.config.TelegramConfig;
 import de.silke.dbans.telegram.listener.PunishmentEventListener;
 import de.silke.dbans.telegram.locale.MessageProvider;
 import de.silke.dbans.telegram.locale.SupportedLocale;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.jetbrains.annotations.NotNull;
 
 import java.io.File;
-
+import java.util.Objects;
 import java.util.logging.Logger;
 
 public final class Main extends JavaPlugin {
 
     private static final Logger log = Logger.getLogger("dbans-telegram-addon");
     private TelegramClient client;
+    private PunishmentEventListener listener;
+
+    private static void notifyAboutException(@NotNull CommandSender sender, @NotNull Throwable ex) {
+        sender.sendMessage("Exception was thrown. Check the console for details");
+        log.severe("Dispatching error: " + ex.getMessage());
+    }
+
+    private static void notifyAboutSuccess(@NotNull CommandSender sender) {
+        if (sender instanceof ConsoleCommandSender) {
+            log.info("Test message delivered");
+        } else {
+            sender.sendMessage("Test message delivered");
+        }
+    }
 
     @Override
     public void onEnable() {
@@ -36,15 +54,62 @@ public final class Main extends JavaPlugin {
 
         client = new TelegramClient(telegramConfig);
         MessageProvider messageProvider = new MessageProvider(this, telegramConfig.getLocale());
-        NotificationService notificationService = new NotificationService(client, messageProvider, telegramConfig.getTimezone());
-        PunishmentEventListener listener = new PunishmentEventListener(telegramConfig, notificationService);
+        NotificationService notificationService = new NotificationService(client,
+                                                                          messageProvider,
+                                                                          telegramConfig.getTimezone());
+        listener = new PunishmentEventListener(telegramConfig, notificationService);
 
         getServer().getPluginManager().registerEvents(listener, this);
+        Objects.requireNonNull(getCommand("dbanstelegram")).setExecutor(new TelegramCommand(this));
         log.info("Enabled (locale: " + telegramConfig.getLocale().getCode() + ")");
     }
 
     @Override
     public void onDisable() {
         if (client != null) client.shutdown();
+    }
+
+    public void reload(@NotNull CommandSender sender) {
+        reloadConfig();
+
+        TelegramConfig telegramConfig = new TelegramConfig(getConfig());
+        if (!telegramConfig.isValid()) {
+            sender.sendMessage("Telegram token or chat ID is not configured. " +
+                               "Reload aborted, keeping previous settings");
+            return;
+        }
+
+        TelegramClient oldClient = client;
+        client = new TelegramClient(telegramConfig);
+
+        MessageProvider messageProvider = new MessageProvider(this, telegramConfig.getLocale());
+        NotificationService notificationService = new NotificationService(client,
+                                                                          messageProvider,
+                                                                          telegramConfig.getTimezone()
+        );
+        listener.update(telegramConfig, notificationService);
+        oldClient.shutdown();
+
+        sender.sendMessage("dbans-telegram-addon reloaded " +
+                           "(locale: " + telegramConfig.getLocale().getCode() + ")");
+        log.info("Reloaded (locale: " + telegramConfig.getLocale().getCode() + ")");
+    }
+
+    public void test(@NotNull CommandSender sender) {
+        if (sender instanceof ConsoleCommandSender) {
+            log.info("Sending test message...");
+        } else {
+            sender.sendMessage("Sending test message...");
+        }
+
+        client.sendMessage("[TEST] By " + sender.getName())
+              .whenComplete((v, ex) -> {
+                  if (ex != null) {
+                      notifyAboutException(sender, ex);
+                  }
+                  getServer().getScheduler().runTask(this, () ->
+                          notifyAboutSuccess(sender)
+                  );
+              });
     }
 }
