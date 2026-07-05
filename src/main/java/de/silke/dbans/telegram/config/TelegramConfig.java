@@ -7,6 +7,7 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.jetbrains.annotations.NotNull;
 
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -78,9 +79,20 @@ public class TelegramConfig {
         return valid;
     }
 
-    public boolean isValid() {
-        return !token.isBlank()
-               && !chatIds.isEmpty()
-               && chatIds.stream().allMatch(TelegramConfig::isValidChatId);
+    public @NotNull List<String> validationErrors() {
+        List<String> errors = new ArrayList<>();
+        if (token.isBlank()) {
+            errors.add("client.token is not configured");
+        }
+        if (chatIds.isEmpty()) {
+            errors.add("client.chat-ids is empty");
+        } else {
+            List<String> invalidIds = chatIds.stream().filter(id -> !isValidChatId(id)).toList();
+            if (!invalidIds.isEmpty()) {
+                errors.add("client.chat-ids contains invalid entries: " + String.join(", ", invalidIds));
+            }
+        }
+        return errors;
     }
+
 }
