@@ -14,6 +14,8 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.File;
 import java.util.Objects;
+import java.util.concurrent.CompletionException;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public final class Main extends JavaPlugin {
@@ -22,9 +24,12 @@ public final class Main extends JavaPlugin {
     private TelegramClient client;
     private PunishmentEventListener listener;
 
-    private static void notifyAboutException(@NotNull CommandSender sender, @NotNull Throwable ex) {
-        sender.sendMessage("Exception was thrown. Check the console for details");
-        log.severe("Dispatching error: " + ex.getMessage());
+    private static void notifyAboutException(
+            @NotNull CommandSender sender,
+            @NotNull Throwable exception
+    ) {
+        sender.sendMessage("Test message could not be delivered. Check the console for details");
+        log.log(Level.SEVERE, "Failed to deliver Telegram test message", exception);
     }
 
     private static void notifyAboutSuccess(@NotNull CommandSender sender) {
@@ -33,6 +38,13 @@ public final class Main extends JavaPlugin {
         } else {
             sender.sendMessage("Test message delivered");
         }
+    }
+
+    private static @NotNull Throwable unwrap(@NotNull Throwable throwable) {
+        if (throwable instanceof CompletionException && throwable.getCause() != null) {
+            return throwable.getCause();
+        }
+        return throwable;
     }
 
     @Override
@@ -103,13 +115,14 @@ public final class Main extends JavaPlugin {
         }
 
         client.sendMessage("[TEST] By " + sender.getName())
-              .whenComplete((v, ex) -> {
-                  if (ex != null) {
-                      notifyAboutException(sender, ex);
-                  }
-                  getServer().getScheduler().runTask(this, () ->
-                          notifyAboutSuccess(sender)
-                  );
-              });
+              .whenComplete((ignored, throwable) ->
+                                    getServer().getScheduler().runTask(this, () -> {
+                                        if (throwable == null) {
+                                            notifyAboutSuccess(sender);
+                                        } else {
+                                            notifyAboutException(sender, unwrap(throwable));
+                                        }
+                                    })
+              );
     }
 }
