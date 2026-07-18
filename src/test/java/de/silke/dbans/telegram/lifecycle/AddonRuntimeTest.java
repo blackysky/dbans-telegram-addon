@@ -233,4 +233,5 @@ class AddonRuntimeTest {
 
         assertThat(runtime.locale().getCode()).isEqualTo("ru");
     }
+
 }
