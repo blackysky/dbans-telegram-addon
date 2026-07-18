@@ -20,13 +20,16 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @SuppressWarnings("ALL")
 class TelegramClientTest {
@@ -77,6 +80,14 @@ class TelegramClientTest {
                 return HttpClient.Version.HTTP_1_1;
             }
         };
+    }
+
+    private static void awaitQuietly(@NotNull CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void startServer(IntFunction<StubResponse> responder) throws Exception {
@@ -263,6 +274,107 @@ class TelegramClientTest {
         assertThat(receivedAt.get(1) - receivedAt.get(0)).isGreaterThanOrEqualTo(Duration.ofMillis(800).toNanos());
     }
 
+    @Test
+    @Timeout(5)
+    void shutdown_rejectsNewMessages_immediatelyWithoutTouchingNetwork() throws Exception {
+        AtomicInteger sendCount = new AtomicInteger();
+        CompletableFuture<HttpResponse<String>> pendingResponse = new CompletableFuture<>();
+        client = clientWithSender(request -> {
+            sendCount.incrementAndGet();
+            return pendingResponse;
+        });
+
+        CompletableFuture<Void> inFlight = client.sendMessage("first");
+        client.shutdown();
+
+        CompletableFuture<Void> rejected = client.sendMessage("second");
+        assertThatThrownBy(() -> rejected.get(1, TimeUnit.SECONDS))
+                .cause().isInstanceOf(IllegalStateException.class);
+        assertThat(sendCount.get()).isEqualTo(1);
+
+        pendingResponse.complete(fakeResponse(200, "{\"ok\":true}"));
+        inFlight.get(4, TimeUnit.SECONDS);
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_isIdempotent_repeatedCallsDoNotThrow() throws Exception {
+        startServer(attempt -> new StubResponse(200, "{\"ok\":true}"));
+
+        client.sendMessage("hello").get(4, TimeUnit.SECONDS);
+
+        client.shutdown();
+        client.shutdown();
+        client.shutdown();
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_duringPacingDelay_completesReturnedFuture() throws Exception {
+        ScheduledExecutorService stuckScheduler = mock(ScheduledExecutorService.class);
+        when(stuckScheduler.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenReturn(null);
+        client = clientWithSenderAndScheduler(
+                request -> CompletableFuture.completedFuture(fakeResponse(200, "{\"ok\":true}")),
+                stuckScheduler
+        );
+
+        CompletableFuture<Void> future = client.sendMessage("hello");
+        client.shutdown();
+
+        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
+                .cause().isInstanceOf(CancellationException.class);
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_duringRetryDelay_completesReturnedFuture() throws Exception {
+        ScheduledExecutorService stuckScheduler = mock(ScheduledExecutorService.class);
+        when(stuckScheduler.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenReturn(null);
+        client = clientWithSenderAndScheduler(
+                request -> CompletableFuture.completedFuture(fakeResponse(503, "{\"ok\":false}")),
+                stuckScheduler
+        );
+
+        CompletableFuture<Void> future = client.sendMessage("hello");
+        client.shutdown();
+
+        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
+                .cause().isInstanceOf(CancellationException.class);
+    }
+
+    @Test
+    @Timeout(10)
+    void sendMessageRacingWithShutdown_neverLeavesAcceptedFutureHanging() throws Exception {
+        for (int i = 0; i < 20; i++) {
+            client = clientWithSender(request -> CompletableFuture.completedFuture(fakeResponse(200, "{\"ok\":true}")));
+
+            CountDownLatch ready = new CountDownLatch(2);
+            CountDownLatch go = new CountDownLatch(1);
+            @SuppressWarnings("unchecked")
+            CompletableFuture<Void>[] result = new CompletableFuture[1];
+
+            Thread sender = new Thread(() -> {
+                ready.countDown();
+                awaitQuietly(go);
+                result[0] = client.sendMessage("hello");
+            });
+            Thread shutdowner = new Thread(() -> {
+                ready.countDown();
+                awaitQuietly(go);
+                client.shutdown();
+            });
+            sender.start();
+            shutdowner.start();
+            ready.await();
+            go.countDown();
+            sender.join();
+            shutdowner.join();
+
+            assertThat(result[0]).isNotNull();
+            result[0].exceptionally(ex -> null).get(3, TimeUnit.SECONDS);
+        }
+    }
+
     private @NotNull TelegramClient clientWithSender(@NotNull TelegramHttpSender sender) {
         FileConfiguration yaml = new YamlConfiguration();
         yaml.set("client.token", "test-token");
@@ -271,7 +383,18 @@ class TelegramClientTest {
         return new TelegramClient(config, "http://unused", sender);
     }
 
+    private @NotNull TelegramClient clientWithSenderAndScheduler(
+            @NotNull TelegramHttpSender sender, @NotNull ScheduledExecutorService scheduler
+    ) {
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("123"));
+        TelegramConfig config = new TelegramConfig(yaml);
+        return new TelegramClient(config, "http://unused", sender, scheduler);
+    }
+
     private record StubResponse(int status, String body) {
 
     }
+
 }
