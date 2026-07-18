@@ -14,8 +14,12 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public class NotificationService {
+
+    private static final Logger log = Logger.getLogger("dbans-telegram-addon");
 
     private final TelegramClient client;
     private final MessageProvider messageProvider;
@@ -85,7 +89,11 @@ public class NotificationService {
 
     private void send(@NotNull MessageKey key, @NotNull PunishmentSnapshot snapshot) {
         String message = messageProvider.format(key, toVars(snapshot));
-        client.sendMessage(message);
+        client.sendMessage(message)
+              .exceptionally(ex -> {
+                  log.log(Level.WARNING, "Failed to deliver Telegram notification", ex);
+                  return null;
+              });
     }
 
     private @NotNull Map<String, String> toVars(@NotNull PunishmentSnapshot snapshot) {
