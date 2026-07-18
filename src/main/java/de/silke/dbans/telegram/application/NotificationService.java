@@ -129,4 +129,5 @@ public class NotificationService {
     private @NotNull String formatInstant(@Nullable Instant instant) {
         return instant != null ? dateFormat.format(instant) : messageProvider.permanent();
     }
+
 }

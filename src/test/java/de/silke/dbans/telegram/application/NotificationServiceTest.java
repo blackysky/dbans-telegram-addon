@@ -18,6 +18,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -39,6 +40,7 @@ class NotificationServiceTest {
     @BeforeEach
     void setUp() {
         mockClient = mock(TelegramClient.class);
+        when(mockClient.sendMessage(anyString())).thenReturn(CompletableFuture.completedFuture(null));
 
         Plugin plugin = mock(Plugin.class);
         when(plugin.getDataFolder()).thenReturn(new File(System.getProperty("java.io.tmpdir"), "dbans-test"));
@@ -128,4 +130,14 @@ class NotificationServiceTest {
         String message = captureMessage();
         assertThat(message).contains("Jail", "JailedSilke", "creative");
     }
+
+    @Test
+    void notify_whenDeliveryFails_doesNotPropagateException() {
+        when(mockClient.sendMessage(anyString()))
+                .thenReturn(CompletableFuture.failedFuture(new RuntimeException("boom")));
+        Punishment punishment = stubPunishment(PunishmentType.JAIL, "JailedSilke", "creative");
+
+        service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
+    }
+
 }
