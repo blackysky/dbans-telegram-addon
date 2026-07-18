@@ -4,6 +4,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import de.silke.dbans.telegram.config.TelegramConfig;
+import lombok.experimental.UtilityClass;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -15,6 +16,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
@@ -28,13 +30,15 @@ public class TelegramClient {
     private static final int MAX_RETRIES = 3;
     private static final Duration MIN_SEND_INTERVAL = Duration.ofSeconds(1);
     private static final Set<Integer> RETRYABLE_STATUS_CODES = Set.of(500, 502, 503, 504);
-    private static final HttpClient DEFAULT_HTTP_CLIENT = createDefaultHttpClient();
 
     private final TelegramConfig config;
     private final String apiBaseUrl;
     private final TelegramHttpSender httpSender;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService scheduler;
     private final Map<String, CompletableFuture<Void>> chatQueues = new ConcurrentHashMap<>();
+    private final Set<CompletableFuture<?>> pendingScheduled = ConcurrentHashMap.newKeySet();
+    private final Object shutdownLock = new Object();
+    private boolean accepting = true;
 
     public TelegramClient(@NotNull TelegramConfig config) {
         this(config, DEFAULT_API_BASE_URL);
@@ -47,14 +51,21 @@ public class TelegramClient {
     TelegramClient(@NotNull TelegramConfig config, @NotNull String apiBaseUrl,
                    @NotNull TelegramHttpSender httpSender
     ) {
+        this(config, apiBaseUrl, httpSender, Executors.newSingleThreadScheduledExecutor());
+    }
+
+    TelegramClient(@NotNull TelegramConfig config, @NotNull String apiBaseUrl,
+                   @NotNull TelegramHttpSender httpSender, @NotNull ScheduledExecutorService scheduler
+    ) {
         this.config = config;
         this.apiBaseUrl = apiBaseUrl;
         this.httpSender = httpSender;
+        this.scheduler = scheduler;
     }
 
     @Contract(pure = true)
     private static @NotNull TelegramHttpSender defaultHttpSender() {
-        return request -> DEFAULT_HTTP_CLIENT.sendAsync(request, HttpResponse.BodyHandlers.ofString());
+        return request -> HttpClientHolder.INSTANCE.sendAsync(request, HttpResponse.BodyHandlers.ofString());
     }
 
     private static HttpClient createDefaultHttpClient() {
@@ -69,26 +80,39 @@ public class TelegramClient {
             JsonObject params = root.getAsJsonObject("parameters");
             if (params != null) {
                 JsonElement retryAfter = params.get("retry_after");
-                if (retryAfter != null) return retryAfter.getAsInt();
+                if (retryAfter != null) {
+                    return retryAfter.getAsInt();
+                }
             }
         } catch (Exception ignored) {
         }
         return 30;
     }
 
+    @Contract(value = " -> new", pure = true)
+    private static @NotNull IllegalStateException shutdownException() {
+        return new IllegalStateException("TelegramClient is shutdown and no longer accepts messages");
+    }
+
     @SuppressWarnings("UnusedReturnValue")
     public @NotNull CompletableFuture<Void> sendMessage(@NotNull String text) {
-        return CompletableFuture.allOf(
-                config.getChatIds().stream()
-                      .map(chatId -> enqueue(chatId, text))
-                      .toArray(CompletableFuture[]::new)
-        );
+        synchronized (shutdownLock) {
+            if (!accepting) {
+                return CompletableFuture.failedFuture(shutdownException());
+            }
+            return CompletableFuture.allOf(
+                    config.getChatIds().stream()
+                          .map(chatId -> enqueue(chatId, text))
+                          .toArray(CompletableFuture[]::new)
+            );
+        }
     }
 
     private @NotNull CompletableFuture<Void> enqueue(@NotNull String chatId, @NotNull String text) {
         CompletableFuture<Void> result = new CompletableFuture<>();
         chatQueues.compute(chatId, (id, previous) ->
-                buildMessageQueue(id, text, result, previous));
+                buildMessageQueue(id, text, result, previous)
+        );
         return result;
     }
 
@@ -119,12 +143,23 @@ public class TelegramClient {
     }
 
     private @NotNull CompletableFuture<Void> delay() {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        scheduler.schedule(() -> future.complete(null),
-                           TelegramClient.MIN_SEND_INTERVAL.toMillis(),
-                           TimeUnit.MILLISECONDS
-        );
-        return future;
+        synchronized (shutdownLock) {
+            if (!accepting) {
+                return CompletableFuture.completedFuture(null);
+            }
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            trackPending(future);
+            scheduler.schedule(() -> future.complete(null),
+                               TelegramClient.MIN_SEND_INTERVAL.toMillis(),
+                               TimeUnit.MILLISECONDS
+            );
+            return future;
+        }
+    }
+
+    private void trackPending(@NotNull CompletableFuture<?> future) {
+        pendingScheduled.add(future);
+        future.whenComplete((v, ex) -> pendingScheduled.remove(future));
     }
 
     private @NotNull CompletableFuture<Void> sendMessage(@NotNull String chatId,
@@ -204,19 +239,47 @@ public class TelegramClient {
     private @NotNull CompletableFuture<Void> scheduleRetry(
             @NotNull String chatId, @NotNull String text, int attempt, long delaySeconds
     ) {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        scheduler.schedule(
-                () -> sendMessage(chatId, text, attempt + 1)
-                        .whenComplete((v, ex) -> {
-                            if (ex != null) future.completeExceptionally(ex);
-                            else future.complete(null);
-                        }),
-                delaySeconds, TimeUnit.SECONDS
-        );
-        return future;
+        synchronized (shutdownLock) {
+            if (!accepting) {
+                return CompletableFuture.failedFuture(shutdownException());
+            }
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            trackPending(future);
+            scheduler.schedule(
+                    () -> sendMessage(chatId, text, attempt + 1)
+                            .whenComplete((v, ex) -> {
+                                if (ex != null) {
+                                    future.completeExceptionally(ex);
+                                } else {
+                                    future.complete(null);
+                                }
+                            }),
+                    delaySeconds, TimeUnit.SECONDS
+            );
+            return future;
+        }
     }
 
     public void shutdown() {
-        scheduler.shutdown();
+        synchronized (shutdownLock) {
+            if (!accepting) {
+                return;
+            }
+            accepting = false;
+        }
+        scheduler.shutdownNow();
+        List<CompletableFuture<?>> batch;
+        while (!(batch = List.copyOf(pendingScheduled)).isEmpty()) {
+            for (CompletableFuture<?> pending : batch) {
+                pending.completeExceptionally(new CancellationException("TelegramClient is shutting down"));
+            }
+        }
     }
+
+    @UtilityClass
+    private static final class HttpClientHolder {
+
+        private static final HttpClient INSTANCE = createDefaultHttpClient();
+    }
+
 }
