@@ -29,34 +29,37 @@ class AddonRuntime {
     }
 
     public void handle(@NotNull PunishmentCreateEvent event) {
-        if (config.isNotifyOnCreate() && isIncluded(event.punishment().type())) {
+        if (!stopped.get() && config.notifications().notifyOnCreate() && isIncluded(event.punishment().type())) {
             notificationService.notify(event);
         }
     }
 
     public void handle(@NotNull PunishmentRevokeEvent event) {
-        if (config.isNotifyOnRevoke() && isIncluded(event.punishment().type())) {
+        if (!stopped.get() && config.notifications().notifyOnRevoke() && isIncluded(event.punishment().type())) {
             notificationService.notify(event);
         }
     }
 
     public void handle(@NotNull PunishmentModifyEvent event) {
-        if (config.isNotifyOnModify() && isIncluded(event.punishment().type())) {
+        if (!stopped.get() && config.notifications().notifyOnModify() && isIncluded(event.punishment().type())) {
             notificationService.notify(event);
         }
     }
 
     public void handle(@NotNull PunishmentExpireEvent event) {
-        if (config.isNotifyOnExpire() && isIncluded(event.punishment().type())) {
+        if (!stopped.get() && config.notifications().notifyOnExpire() && isIncluded(event.punishment().type())) {
             notificationService.notify(event);
         }
     }
 
     private boolean isIncluded(@NotNull PunishmentType type) {
-        return !config.getIgnoredTypes().contains(type);
+        return !config.notifications().ignoredTypes().contains(type);
     }
 
     @NotNull CompletableFuture<Void> sendTestMessage(@NotNull String text) {
+        if (stopped.get()) {
+            return CompletableFuture.failedFuture(new IllegalStateException("AddonRuntime is stopped"));
+        }
         return client.sendMessage(text);
     }
 
