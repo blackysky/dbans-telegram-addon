@@ -8,10 +8,13 @@ import me.demro.dlibs.dbans.api.event.PunishmentRevokeEvent;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.plugin.Plugin;
+import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.List;
 import java.util.concurrent.CompletionException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -21,11 +24,12 @@ public class AddonController {
 
     private static final Logger log = Logger.getLogger("dbans-telegram-addon");
 
+    private final Object lock = new Object();
     private final Plugin plugin;
     private final AddonRuntimeFactory runtimeFactory;
 
-    private volatile AddonRuntime runtime;
-    private volatile AddonState state = AddonState.INACTIVE;
+    private volatile Snapshot snapshot = Snapshot.inactive();
+    private boolean started;
 
     private static void notifyAboutSuccess(@NotNull CommandSender sender) {
         if (sender instanceof ConsoleCommandSender) {
@@ -48,69 +52,87 @@ public class AddonController {
     }
 
     @NotNull AddonState getState() {
-        return state;
+        return snapshot.state();
     }
 
     public void start(@NotNull FileConfiguration config) {
-        AddonRuntimeFactory.Result result = runtimeFactory.create(config);
-        if (result.isValid()) {
-            runtime = result.runtime();
-            state = AddonState.ACTIVE;
-            log.info("Enabled (locale: " + runtime.locale().getCode() + ")");
-        } else {
-            state = AddonState.INACTIVE;
-            log.warning("Telegram integration is inactive (" + String.join("; ", result.errors()) + "). "
-                        + "Fill in the configuration and run /dbanstelegram reload to activate it");
+        synchronized (lock) {
+            if (started) {
+                log.warning("start() was already called once; ignoring the repeated call");
+                return;
+            }
+            started = true;
+
+            AddonRuntimeFactory.Result result = createSafely(config);
+            if (result.isValid()) {
+                AddonRuntime runtime = result.runtime();
+                snapshot = Snapshot.active(runtime);
+                logWarnings(result.warnings());
+                log.info("Enabled (locale: " + runtime.locale().getCode() + ")");
+            } else {
+                snapshot = Snapshot.inactive();
+                log.warning("Telegram integration is inactive (" + String.join("; ", result.errors()) + "). "
+                            + "Fill in the configuration and use /dbanstelegram reload to activate it");
+            }
         }
     }
 
-    @SuppressWarnings("MethodWithMultipleReturnPoints")
     public void reload(@NotNull CommandSender sender, @NotNull FileConfiguration config) {
-        if (state == AddonState.STOPPED) {
-            sender.sendMessage("dbans-telegram-addon is stopped and cannot be reloaded");
-            return;
+        AddonRuntime oldRuntime;
+        AddonRuntime newRuntime;
+        synchronized (lock) {
+            Snapshot current = snapshot;
+            if (current.state() == AddonState.STOPPED) {
+                sender.sendMessage("dbans-telegram-addon is stopped and cannot be reloaded");
+                return;
+            }
+
+            AddonRuntimeFactory.Result result = createSafely(config);
+            if (!result.isValid()) {
+                sender.sendMessage("Reload aborted, keeping previous settings: " + String.join("; ", result.errors()));
+                return;
+            }
+
+            oldRuntime = current.runtime();
+            newRuntime = result.runtime();
+            snapshot = Snapshot.active(newRuntime);
+            logWarnings(result.warnings());
         }
 
-        AddonRuntimeFactory.Result result = runtimeFactory.create(config);
-        if (!result.isValid()) {
-            sender.sendMessage("Reload aborted, keeping previous settings: " + String.join("; ", result.errors()));
-            return;
-        }
-
-        AddonRuntime oldRuntime = runtime;
-        runtime = result.runtime();
-        state = AddonState.ACTIVE;
         if (oldRuntime != null) {
             oldRuntime.shutdown();
         }
 
-        sender.sendMessage("dbans-telegram-addon reloaded (locale: " + runtime.locale().getCode() + ")");
-        log.info("Reloaded (locale: " + runtime.locale().getCode() + ")");
+        sender.sendMessage("dbans-telegram-addon reloaded (locale: " + newRuntime.locale().getCode() + ")");
+        log.info("Reloaded (locale: " + newRuntime.locale().getCode() + ")");
     }
 
     public void stop() {
-        if (state == AddonState.STOPPED) {
-            return;
-        }
+        AddonRuntime current;
+        synchronized (lock) {
+            if (snapshot.state() == AddonState.STOPPED) {
+                return;
+            }
 
-        state = AddonState.STOPPED;
-        AddonRuntime current = runtime;
+            current = snapshot.runtime();
+            snapshot = Snapshot.stopped();
+        }
         if (current != null) {
             current.shutdown();
         }
     }
 
-    @SuppressWarnings("MethodWithMultipleReturnPoints")
     public void test(@NotNull CommandSender sender) {
-        if (state == AddonState.STOPPED) {
+        Snapshot current = snapshot;
+        if (current.state() == AddonState.STOPPED) {
             sender.sendMessage("dbans-telegram-addon is stopped");
             return;
         }
 
-        AddonRuntime current = runtime;
-        if (state != AddonState.ACTIVE || current == null) {
+        AddonRuntime runtime = current.runtime();
+        if (current.state() != AddonState.ACTIVE || runtime == null) {
             sender.sendMessage("Telegram integration is not configured. " +
-                               "Fill in the configuration and run /dbanstelegram reload to activate it");
+                               "Fill in the configuration and use /dbanstelegram reload to activate it");
             return;
         }
 
@@ -120,16 +142,23 @@ public class AddonController {
             sender.sendMessage("Sending test message...");
         }
 
-        current.sendTestMessage("[TEST] By " + sender.getName())
-               .whenComplete((ignored, throwable) ->
-                                     plugin.getServer().getScheduler().runTask(plugin, () -> {
-                                         if (throwable == null) {
-                                             notifyAboutSuccess(sender);
-                                         } else {
-                                             notifyAboutException(sender, unwrap(throwable));
-                                         }
-                                     })
-               );
+        runtime.sendTestMessage("[TEST] By " + sender.getName())
+               .whenComplete((ignored, throwable) -> {
+                   if (snapshot.state() == AddonState.STOPPED) {
+                       return;
+                   }
+                   try {
+                       plugin.getServer().getScheduler().runTask(plugin, () -> {
+                           if (throwable == null) {
+                               notifyAboutSuccess(sender);
+                           } else {
+                               notifyAboutException(sender, unwrap(throwable));
+                           }
+                       });
+                   } catch (IllegalPluginAccessException e) {
+                       log.warning("Could not deliver test message result; the plugin is disabling");
+                   }
+               });
     }
 
     public void onCreate(@NotNull PunishmentCreateEvent event) {
@@ -160,8 +189,43 @@ public class AddonController {
         }
     }
 
+    private @NotNull AddonRuntimeFactory.Result createSafely(@NotNull FileConfiguration config) {
+        try {
+            return runtimeFactory.create(config);
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Unexpected failure while creating the Telegram runtime", e);
+            return AddonRuntimeFactory.Result.invalid(List.of("Unexpected error: " + e.getMessage()));
+        }
+    }
+
+    private void logWarnings(@NotNull List<String> warnings) {
+        if (!warnings.isEmpty()) {
+            log.warning("Telegram configuration warnings: " + String.join("; ", warnings));
+        }
+    }
+
     private @Nullable AddonRuntime activeRuntime() {
-        return state == AddonState.ACTIVE ? runtime : null;
+        Snapshot current = snapshot;
+        return current.state() == AddonState.ACTIVE ? current.runtime() : null;
+    }
+
+    private record Snapshot(AddonState state, AddonRuntime runtime) {
+
+        @Contract(" -> new")
+        static @NotNull Snapshot inactive() {
+            return new Snapshot(AddonState.INACTIVE, null);
+        }
+
+        @Contract("_ -> new")
+        static @NotNull Snapshot active(@NotNull AddonRuntime runtime) {
+            return new Snapshot(AddonState.ACTIVE, runtime);
+        }
+
+        @Contract(" -> new")
+        static @NotNull Snapshot stopped() {
+            return new Snapshot(AddonState.STOPPED, null);
+        }
+
     }
 
 }
