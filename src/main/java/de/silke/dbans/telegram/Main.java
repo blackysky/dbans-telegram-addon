@@ -5,9 +5,7 @@ import de.silke.dbans.telegram.lifecycle.AddonController;
 import de.silke.dbans.telegram.lifecycle.AddonRuntimeFactory;
 import de.silke.dbans.telegram.listener.PunishmentEventListener;
 import de.silke.dbans.telegram.locale.SupportedLocale;
-import org.bukkit.command.CommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.jetbrains.annotations.NotNull;
 
 import java.io.File;
 import java.util.Objects;
@@ -28,22 +26,17 @@ public final class Main extends JavaPlugin {
 
         controller = new AddonController(this, new AddonRuntimeFactory(this));
         getServer().getPluginManager().registerEvents(new PunishmentEventListener(controller), this);
-        Objects.requireNonNull(getCommand("dbanstelegram")).setExecutor(new TelegramCommand(this));
+        Objects.requireNonNull(getCommand("dbanstelegram")).setExecutor(
+                new TelegramCommand(this, controller)
+        );
         controller.start(getConfig());
     }
 
     @Override
     public void onDisable() {
-        if (controller != null) controller.stop();
-    }
-
-    public void reload(@NotNull CommandSender sender) {
-        reloadConfig();
-        controller.reload(sender, getConfig());
-    }
-
-    public void test(@NotNull CommandSender sender) {
-        controller.test(sender);
+        if (controller != null) {
+            controller.stop();
+        }
     }
 
 }
