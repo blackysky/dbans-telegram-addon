@@ -3,9 +3,12 @@ package de.silke.dbans.telegram.lifecycle;
 import me.demro.dlibs.dbans.api.event.EventOrigin;
 import me.demro.dlibs.dbans.api.event.PunishmentCreateEvent;
 import me.demro.dlibs.dbans.api.punishment.Punishment;
+import org.bukkit.Server;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.scheduler.BukkitScheduler;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -14,8 +17,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class AddonControllerTest {
@@ -45,6 +47,18 @@ class AddonControllerTest {
 
     private void stubCreate(AddonRuntimeFactory.Result result) {
         when(factory.create(any(FileConfiguration.class))).thenReturn(result);
+    }
+
+    private BukkitScheduler stubImmediateScheduler() {
+        Server server = mock(Server.class);
+        BukkitScheduler scheduler = mock(BukkitScheduler.class);
+        when(plugin.getServer()).thenReturn(server);
+        when(server.getScheduler()).thenReturn(scheduler);
+        doAnswer(invocation -> {
+            ((Runnable) invocation.getArgument(1)).run();
+            return null;
+        }).when(scheduler).runTask(eq(plugin), any(Runnable.class));
+        return scheduler;
     }
 
     @Test
@@ -187,12 +201,79 @@ class AddonControllerTest {
         controller.start(mock(FileConfiguration.class));
         controller.stop();
 
+        verify(factory, times(1)).create(any(FileConfiguration.class));
+
         AddonRuntime newRuntime = validRuntime();
         stubCreate(AddonRuntimeFactory.Result.success(newRuntime));
         controller.reload(sender, mock(FileConfiguration.class));
 
         assertThat(controller.getState()).isEqualTo(AddonState.STOPPED);
+        verify(factory, times(1)).create(any(FileConfiguration.class));
         verifyNoInteractions(newRuntime);
+    }
+
+    @Test
+    void start_calledTwice_secondCallIsIgnored() {
+        AddonRuntime first = validRuntime();
+        stubCreate(AddonRuntimeFactory.Result.success(first));
+        controller.start(mock(FileConfiguration.class));
+
+        AddonRuntime second = validRuntime();
+        stubCreate(AddonRuntimeFactory.Result.success(second));
+        controller.start(mock(FileConfiguration.class));
+
+        assertThat(controller.getState()).isEqualTo(AddonState.ACTIVE);
+        verify(factory, times(1)).create(any(FileConfiguration.class));
+        verifyNoInteractions(second);
+        verify(first, never()).shutdown();
+    }
+
+    @Test
+    void start_calledAgainAfterInactive_isIgnored() {
+        stubCreate(AddonRuntimeFactory.Result.invalid(List.of("bad")));
+        controller.start(mock(FileConfiguration.class));
+        assertThat(controller.getState()).isEqualTo(AddonState.INACTIVE);
+
+        AddonRuntime runtime = validRuntime();
+        stubCreate(AddonRuntimeFactory.Result.success(runtime));
+        controller.start(mock(FileConfiguration.class));
+
+        assertThat(controller.getState()).isEqualTo(AddonState.INACTIVE);
+        verifyNoInteractions(runtime);
+    }
+
+    @Test
+    void start_calledAfterStop_isIgnored() {
+        AddonRuntime runtime = validRuntime();
+        stubCreate(AddonRuntimeFactory.Result.success(runtime));
+        controller.start(mock(FileConfiguration.class));
+        controller.stop();
+
+        AddonRuntime another = validRuntime();
+        stubCreate(AddonRuntimeFactory.Result.success(another));
+        controller.start(mock(FileConfiguration.class));
+
+        assertThat(controller.getState()).isEqualTo(AddonState.STOPPED);
+        verifyNoInteractions(another);
+    }
+
+    @Test
+    void reload_whenFactoryThrows_preservesOldRuntimeAndReportsError() {
+        AddonRuntime oldRuntime = validRuntime();
+        stubCreate(AddonRuntimeFactory.Result.success(oldRuntime));
+        controller.start(mock(FileConfiguration.class));
+
+        when(factory.create(any(FileConfiguration.class))).thenThrow(new RuntimeException("boom"));
+
+        controller.reload(sender, mock(FileConfiguration.class));
+
+        assertThat(controller.getState()).isEqualTo(AddonState.ACTIVE);
+        verify(oldRuntime, never()).shutdown();
+        verify(sender).sendMessage(contains("Reload aborted, keeping previous settings"));
+
+        PunishmentCreateEvent event = createEvent();
+        controller.onCreate(event);
+        verify(oldRuntime).handle(event);
     }
 
     @Test
@@ -225,6 +306,75 @@ class AddonControllerTest {
         controller.test(sender);
 
         verify(runtime).sendTestMessage("[TEST] By Admin");
+    }
+
+    @Test
+    void test_whileActive_onSuccess_notifiesSenderOnMainThread() {
+        stubImmediateScheduler();
+        AddonRuntime runtime = validRuntime();
+        CompletableFuture<Void> sendResult = new CompletableFuture<>();
+        when(runtime.sendTestMessage(any())).thenReturn(sendResult);
+        stubCreate(AddonRuntimeFactory.Result.success(runtime));
+        controller.start(mock(FileConfiguration.class));
+        when(sender.getName()).thenReturn("Admin");
+
+        controller.test(sender);
+        sendResult.complete(null);
+
+        verify(sender).sendMessage("Test message delivered");
+    }
+
+    @Test
+    void test_whileActive_onFailure_notifiesSenderOfError() {
+        stubImmediateScheduler();
+        AddonRuntime runtime = validRuntime();
+        CompletableFuture<Void> sendResult = new CompletableFuture<>();
+        when(runtime.sendTestMessage(any())).thenReturn(sendResult);
+        stubCreate(AddonRuntimeFactory.Result.success(runtime));
+        controller.start(mock(FileConfiguration.class));
+        when(sender.getName()).thenReturn("Admin");
+
+        controller.test(sender);
+        sendResult.completeExceptionally(new RuntimeException("network down"));
+
+        verify(sender).sendMessage(contains("could not be delivered"));
+    }
+
+    @Test
+    void test_completionAfterStop_doesNotScheduleBukkitTask() {
+        AddonRuntime runtime = validRuntime();
+        CompletableFuture<Void> sendResult = new CompletableFuture<>();
+        when(runtime.sendTestMessage(any())).thenReturn(sendResult);
+        stubCreate(AddonRuntimeFactory.Result.success(runtime));
+        controller.start(mock(FileConfiguration.class));
+        when(sender.getName()).thenReturn("Admin");
+
+        controller.test(sender);
+        controller.stop();
+        sendResult.complete(null);
+
+        verifyNoInteractions(plugin);
+    }
+
+    @Test
+    void test_completionRacesPluginDisable_doesNotPropagate() {
+        AddonRuntime runtime = validRuntime();
+        CompletableFuture<Void> sendResult = new CompletableFuture<>();
+        when(runtime.sendTestMessage(any())).thenReturn(sendResult);
+        stubCreate(AddonRuntimeFactory.Result.success(runtime));
+        controller.start(mock(FileConfiguration.class));
+        when(sender.getName()).thenReturn("Admin");
+
+        Server server = mock(Server.class);
+        BukkitScheduler scheduler = mock(BukkitScheduler.class);
+        when(plugin.getServer()).thenReturn(server);
+        when(server.getScheduler()).thenReturn(scheduler);
+        doThrow(new IllegalPluginAccessException("plugin disabled"))
+                .when(scheduler).runTask(eq(plugin), any(Runnable.class));
+
+        controller.test(sender);
+
+        sendResult.complete(null);
     }
 
 }
