@@ -6,6 +6,7 @@ import de.silke.dbans.telegram.locale.MessageProvider;
 import de.silke.dbans.telegram.model.PunishmentSnapshot;
 import me.demro.dlibs.dbans.api.event.*;
 import me.demro.dlibs.dbans.api.punishment.Punishment;
+import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -14,6 +15,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CompletionException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -29,6 +31,17 @@ public class NotificationService {
         this.client = client;
         this.messageProvider = messageProvider;
         this.dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z").withZone(timezone);
+    }
+
+    @Contract(pure = true)
+    static boolean isLifecycleCancellation(@NotNull Throwable cause) {
+        return cause instanceof IllegalStateException;
+    }
+
+    private static @NotNull Throwable unwrap(@NotNull Throwable throwable) {
+        return throwable instanceof CompletionException && throwable.getCause() != null
+                ? throwable.getCause()
+                : throwable;
     }
 
     public void notify(@NotNull PunishmentCreateEvent event) {
@@ -91,9 +104,17 @@ public class NotificationService {
         String message = messageProvider.format(key, toVars(snapshot));
         client.sendMessage(message)
               .exceptionally(ex -> {
-                  log.log(Level.WARNING, "Failed to deliver Telegram notification", ex);
+                  logFailure(unwrap(ex));
                   return null;
               });
+    }
+
+    private void logFailure(@NotNull Throwable cause) {
+        if (isLifecycleCancellation(cause)) {
+            log.log(Level.FINE, "Telegram notification skipped: addon is shutting down", cause);
+        } else {
+            log.log(Level.WARNING, "Failed to deliver Telegram notification", cause);
+        }
     }
 
     private @NotNull Map<String, String> toVars(@NotNull PunishmentSnapshot snapshot) {

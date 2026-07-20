@@ -18,6 +18,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -138,6 +139,36 @@ class NotificationServiceTest {
         Punishment punishment = stubPunishment(PunishmentType.JAIL, "JailedSilke", "creative");
 
         service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
+    }
+
+    @Test
+    void notify_whenQueueIsShuttingDown_doesNotPropagateException() {
+        when(mockClient.sendMessage(anyString()))
+                .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("shut down")));
+        Punishment punishment = stubPunishment(PunishmentType.JAIL, "JailedSilke", "creative");
+
+        service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
+    }
+
+    @Test
+    void notify_whenForciblyCancelledByShutdown_doesNotPropagateException() {
+        when(mockClient.sendMessage(anyString()))
+                .thenReturn(CompletableFuture.failedFuture(new CancellationException("cancelled")));
+        Punishment punishment = stubPunishment(PunishmentType.JAIL, "JailedSilke", "creative");
+
+        service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
+    }
+
+    @Test
+    void isLifecycleCancellation_classifiesShutdownRelatedFailuresAsLifecycle() {
+        assertThat(NotificationService.isLifecycleCancellation(new IllegalStateException("shut down"))).isTrue();
+        assertThat(NotificationService.isLifecycleCancellation(new CancellationException("cancelled"))).isTrue();
+    }
+
+    @Test
+    void isLifecycleCancellation_classifiesRealDeliveryFailuresAsNotLifecycle() {
+        assertThat(NotificationService.isLifecycleCancellation(new RuntimeException("boom"))).isFalse();
+        assertThat(NotificationService.isLifecycleCancellation(new java.io.IOException("network down"))).isFalse();
     }
 
 }
