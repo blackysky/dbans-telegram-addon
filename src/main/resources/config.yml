@@ -11,3 +11,8 @@ notifications:
   on-modify: true
   on-expire: true
   ignored-types: [ ]
+
+queue:
+  capacity: 100
+  overflow-policy: DROP_NEWEST
+  shutdown-timeout-seconds: 10
