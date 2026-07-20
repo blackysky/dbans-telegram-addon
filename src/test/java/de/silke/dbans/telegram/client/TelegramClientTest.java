@@ -26,12 +26,7 @@ import java.util.function.IntFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
-@SuppressWarnings("ALL")
 class TelegramClientTest {
 
     private HttpServer server;
@@ -217,7 +212,7 @@ class TelegramClientTest {
 
     @Test
     @Timeout(10)
-    void failsAfterNetworkRetryLimit() throws Exception {
+    void failsAfterNetworkRetryLimit() {
         AtomicInteger attempts = new AtomicInteger();
         IOException networkError = new IOException("simulated network failure");
         client = clientWithSender(request -> {
@@ -298,55 +293,80 @@ class TelegramClientTest {
 
     @Test
     @Timeout(5)
-    void shutdown_isIdempotent_repeatedCallsDoNotThrow() throws Exception {
+    void shutdown_isIdempotent_repeatedCallsReturnSameFuture() throws Exception {
         startServer(attempt -> new StubResponse(200, "{\"ok\":true}"));
 
         client.sendMessage("hello").get(4, TimeUnit.SECONDS);
 
-        client.shutdown();
-        client.shutdown();
-        client.shutdown();
+        CompletableFuture<Void> first = client.shutdown();
+        CompletableFuture<Void> second = client.shutdown();
+        CompletableFuture<Void> third = client.shutdown();
+
+        assertThat(second).isSameAs(first);
+        assertThat(third).isSameAs(first);
+        first.get(4, TimeUnit.SECONDS);
     }
 
     @Test
     @Timeout(5)
-    void shutdown_duringPacingDelay_completesReturnedFuture() throws Exception {
-        ScheduledExecutorService stuckScheduler = mock(ScheduledExecutorService.class);
-        when(stuckScheduler.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenReturn(null);
-        client = clientWithSenderAndScheduler(
+    void shutdown_drainsAcceptedWorkBeforeCompletingNormally() throws Exception {
+        startServer(attempt -> new StubResponse(200, "{\"ok\":true}"));
+
+        client.sendMessage("hello");
+        CompletableFuture<Void> shutdown = client.shutdown();
+
+        shutdown.get(4, TimeUnit.SECONDS);
+        assertThat(client.aggregateQueueStatistics().depth()).isZero();
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_duringPacingDelay_afterTimeoutExpires_completesReturnedFutureExceptionally() throws Exception {
+        client = clientWithSenderAndShutdownTimeout(
                 request -> CompletableFuture.completedFuture(fakeResponse(200, "{\"ok\":true}")),
-                stuckScheduler
+                Duration.ZERO
         );
 
         CompletableFuture<Void> future = client.sendMessage("hello");
         client.shutdown();
 
-        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
+        assertThatThrownBy(() -> future.get(3, TimeUnit.SECONDS))
                 .cause().isInstanceOf(CancellationException.class);
     }
 
     @Test
     @Timeout(5)
-    void shutdown_duringRetryDelay_completesReturnedFuture() throws Exception {
-        ScheduledExecutorService stuckScheduler = mock(ScheduledExecutorService.class);
-        when(stuckScheduler.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenReturn(null);
-        client = clientWithSenderAndScheduler(
+    void shutdown_duringRetryDelay_afterTimeoutExpires_completesReturnedFutureExceptionally() throws Exception {
+        client = clientWithSenderAndShutdownTimeout(
                 request -> CompletableFuture.completedFuture(fakeResponse(503, "{\"ok\":false}")),
-                stuckScheduler
+                Duration.ZERO
         );
 
         CompletableFuture<Void> future = client.sendMessage("hello");
         client.shutdown();
 
-        assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
+        assertThatThrownBy(() -> future.get(3, TimeUnit.SECONDS))
                 .cause().isInstanceOf(CancellationException.class);
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_forcedTimeout_bringsQueueDepthBackToZero() throws Exception {
+        CompletableFuture<HttpResponse<String>> neverCompletes = new CompletableFuture<>();
+        client = clientWithSenderAndShutdownTimeout(request -> neverCompletes, Duration.ZERO);
+
+        client.sendMessage("hello");
+        client.shutdown().get(3, TimeUnit.SECONDS);
+
+        assertThat(client.aggregateQueueStatistics().depth()).isZero();
     }
 
     @Test
     @Timeout(10)
     void sendMessageRacingWithShutdown_neverLeavesAcceptedFutureHanging() throws Exception {
         for (int i = 0; i < 20; i++) {
-            client = clientWithSender(request -> CompletableFuture.completedFuture(fakeResponse(200, "{\"ok\":true}")));
+            client = clientWithSenderAndShutdownTimeout(
+                    request -> CompletableFuture.completedFuture(fakeResponse(200, "{\"ok\":true}")), Duration.ZERO);
 
             CountDownLatch ready = new CountDownLatch(2);
             CountDownLatch go = new CountDownLatch(1);
@@ -375,6 +395,72 @@ class TelegramClientTest {
         }
     }
 
+    @Test
+    @Timeout(5)
+    void fullQueueForOneChat_failsAggregatedFutureAndIsObservableInStatistics() throws Exception {
+        CompletableFuture<Void> stuckChat1 = new CompletableFuture<>();
+        TelegramDeliverySender fake = new TelegramDeliverySender() {
+            @Override
+            public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+                return "1".equals(chatId) ? stuckChat1 : CompletableFuture.completedFuture(null);
+            }
+
+            @Override
+            public void cancelAllPending() {
+            }
+        };
+
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("1", "2"));
+        yaml.set("queue.capacity", 1);
+        yaml.set("queue.shutdown-timeout-seconds", 0);
+        TelegramConfig config = new TelegramConfig(yaml);
+        client = new TelegramClient(config, Executors.newSingleThreadScheduledExecutor(), fake);
+
+        client.sendMessage("first");
+        CompletableFuture<Void> second = client.sendMessage("second");
+
+        assertThatThrownBy(() -> second.get(2, TimeUnit.SECONDS))
+                .cause().isInstanceOf(TelegramQueueFullException.class);
+
+        assertThat(client.queueStatistics().get("1").depth()).isEqualTo(1);
+        assertThat(client.queueStatistics().get("1").dropped()).isEqualTo(1);
+        assertThat(client.queueStatistics().get("2").depth()).isZero();
+        assertThat(client.queueStatistics().get("2").dropped()).isZero();
+        assertThat(client.aggregateQueueStatistics().dropped()).isEqualTo(1);
+    }
+
+    @Test
+    @Timeout(5)
+    void oneSlowChat_doesNotBlockAnotherChatsProgress() throws Exception {
+        CompletableFuture<Void> stuckChat1 = new CompletableFuture<>();
+        TelegramDeliverySender fake = new TelegramDeliverySender() {
+            @Override
+            public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+                return "1".equals(chatId) ? stuckChat1 : CompletableFuture.completedFuture(null);
+            }
+
+            @Override
+            public void cancelAllPending() {
+            }
+        };
+
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("1", "2"));
+        yaml.set("queue.shutdown-timeout-seconds", 0);
+        TelegramConfig config = new TelegramConfig(yaml);
+        client = new TelegramClient(config, Executors.newSingleThreadScheduledExecutor(), fake);
+
+        client.sendMessage("a");
+        client.sendMessage("b");
+        client.sendMessage("c");
+
+        assertThat(client.queueStatistics().get("2").depth()).isZero();
+        assertThat(client.queueStatistics().get("1").depth()).isEqualTo(3);
+    }
+
     private @NotNull TelegramClient clientWithSender(@NotNull TelegramHttpSender sender) {
         FileConfiguration yaml = new YamlConfiguration();
         yaml.set("client.token", "test-token");
@@ -383,14 +469,15 @@ class TelegramClientTest {
         return new TelegramClient(config, "http://unused", sender);
     }
 
-    private @NotNull TelegramClient clientWithSenderAndScheduler(
-            @NotNull TelegramHttpSender sender, @NotNull ScheduledExecutorService scheduler
+    private @NotNull TelegramClient clientWithSenderAndShutdownTimeout(
+            @NotNull TelegramHttpSender sender, @NotNull Duration shutdownTimeout
     ) {
         FileConfiguration yaml = new YamlConfiguration();
         yaml.set("client.token", "test-token");
         yaml.set("client.chat-ids", List.of("123"));
+        yaml.set("queue.shutdown-timeout-seconds", shutdownTimeout.toSeconds());
         TelegramConfig config = new TelegramConfig(yaml);
-        return new TelegramClient(config, "http://unused", sender, scheduler);
+        return new TelegramClient(config, "http://unused", sender);
     }
 
     private record StubResponse(int status, String body) {
