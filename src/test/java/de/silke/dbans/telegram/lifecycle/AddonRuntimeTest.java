@@ -188,7 +188,9 @@ class AddonRuntimeTest {
         FileConfiguration yaml = baseYaml();
         TelegramConfig config = new TelegramConfig(yaml);
         NotificationService notificationService = mock(NotificationService.class);
-        AddonRuntime runtime = new AddonRuntime(config, mock(TelegramClient.class), notificationService);
+        TelegramClient client = mock(TelegramClient.class);
+        when(client.shutdown()).thenReturn(CompletableFuture.completedFuture(null));
+        AddonRuntime runtime = new AddonRuntime(config, client, notificationService);
 
         runtime.shutdown();
         runtime.handle(createEvent(PunishmentType.BAN));
@@ -201,6 +203,7 @@ class AddonRuntimeTest {
         FileConfiguration yaml = baseYaml();
         TelegramConfig config = new TelegramConfig(yaml);
         TelegramClient client = mock(TelegramClient.class);
+        when(client.shutdown()).thenReturn(CompletableFuture.completedFuture(null));
         AddonRuntime runtime = new AddonRuntime(config, client, mock(NotificationService.class));
 
         runtime.shutdown();
@@ -216,11 +219,41 @@ class AddonRuntimeTest {
         FileConfiguration yaml = baseYaml();
         TelegramConfig config = new TelegramConfig(yaml);
         TelegramClient client = mock(TelegramClient.class);
+        when(client.shutdown()).thenReturn(new CompletableFuture<>());
         AddonRuntime runtime = new AddonRuntime(config, client, mock(NotificationService.class));
 
         runtime.shutdown();
         runtime.shutdown();
 
+        verify(client, times(1)).shutdown();
+    }
+
+    @Test
+    void shutdown_returnsClientsTerminationFuture() {
+        FileConfiguration yaml = baseYaml();
+        TelegramConfig config = new TelegramConfig(yaml);
+        TelegramClient client = mock(TelegramClient.class);
+        CompletableFuture<Void> termination = new CompletableFuture<>();
+        when(client.shutdown()).thenReturn(termination);
+        AddonRuntime runtime = new AddonRuntime(config, client, mock(NotificationService.class));
+
+        CompletableFuture<Void> result = runtime.shutdown();
+
+        assertThat(result).isSameAs(termination);
+    }
+
+    @Test
+    void shutdown_calledAgainAfterFirstCompletes_doesNotHang() throws Exception {
+        FileConfiguration yaml = baseYaml();
+        TelegramConfig config = new TelegramConfig(yaml);
+        TelegramClient client = mock(TelegramClient.class);
+        when(client.shutdown()).thenReturn(CompletableFuture.completedFuture(null));
+        AddonRuntime runtime = new AddonRuntime(config, client, mock(NotificationService.class));
+
+        runtime.shutdown().get(1, TimeUnit.SECONDS);
+        CompletableFuture<Void> second = runtime.shutdown();
+
+        second.get(1, TimeUnit.SECONDS);
         verify(client, times(1)).shutdown();
     }
 

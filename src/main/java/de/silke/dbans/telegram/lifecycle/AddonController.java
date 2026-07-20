@@ -58,7 +58,7 @@ public class AddonController {
     public void start(@NotNull FileConfiguration config) {
         synchronized (lock) {
             if (started) {
-                log.warning("start() was already called once; ignoring the repeated call");
+                log.warning("start() was already called once. Ignoring the repeated call");
                 return;
             }
             started = true;
@@ -100,7 +100,10 @@ public class AddonController {
         }
 
         if (oldRuntime != null) {
-            oldRuntime.shutdown();
+            oldRuntime.shutdown().exceptionally(ex -> {
+                log.log(Level.WARNING, "Old Telegram runtime failed to shut down cleanly during reload", ex);
+                return null;
+            });
         }
 
         sender.sendMessage("dbans-telegram-addon reloaded (locale: " + newRuntime.locale().getCode() + ")");
@@ -118,7 +121,10 @@ public class AddonController {
             snapshot = Snapshot.stopped();
         }
         if (current != null) {
-            current.shutdown();
+            current.shutdown().exceptionally(ex -> {
+                log.log(Level.WARNING, "Telegram runtime failed to shut down cleanly", ex);
+                return null;
+            });
         }
     }
 

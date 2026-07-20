@@ -63,10 +63,11 @@ class AddonRuntime {
         return client.sendMessage(text);
     }
 
-    void shutdown() {
+    @NotNull CompletableFuture<Void> shutdown() {
         if (stopped.compareAndSet(false, true)) {
-            client.shutdown();
+            return client.shutdown();
         }
+        return CompletableFuture.completedFuture(null);
     }
 
 }
