@@ -23,6 +23,8 @@ class AddonRuntime {
     private final TelegramClient client;
     private final NotificationService notificationService;
     private final AtomicBoolean stopped = new AtomicBoolean();
+    private final Object shutdownLock = new Object();
+    private volatile CompletableFuture<Void> shutdownFuture;
 
     public @NotNull SupportedLocale locale() {
         return config.getLocale();
@@ -64,10 +66,16 @@ class AddonRuntime {
     }
 
     @NotNull CompletableFuture<Void> shutdown() {
-        if (stopped.compareAndSet(false, true)) {
-            return client.shutdown();
+        stopped.set(true);
+        CompletableFuture<Void> existing = shutdownFuture;
+        if (existing != null) {
+            return existing;
         }
-        return CompletableFuture.completedFuture(null);
+        synchronized (shutdownLock) {
+            if (shutdownFuture == null) {
+                shutdownFuture = client.shutdown();
+            }
+            return shutdownFuture;
+        }
     }
-
 }

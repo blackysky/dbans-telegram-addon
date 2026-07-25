@@ -243,6 +243,46 @@ class AddonRuntimeTest {
     }
 
     @Test
+    void shutdown_calledAgainWhileFirstStillIncomplete_returnsSameIncompleteFutureWithoutEarlyCompletion() {
+        FileConfiguration yaml = baseYaml();
+        TelegramConfig config = new TelegramConfig(yaml);
+        TelegramClient client = mock(TelegramClient.class);
+        CompletableFuture<Void> termination = new CompletableFuture<>();
+        when(client.shutdown()).thenReturn(termination);
+        AddonRuntime runtime = new AddonRuntime(config, client, mock(NotificationService.class));
+
+        CompletableFuture<Void> first = runtime.shutdown();
+        CompletableFuture<Void> second = runtime.shutdown();
+
+        assertThat(second).isSameAs(first);
+        assertThat(second).isNotDone();
+        verify(client, times(1)).shutdown();
+
+        termination.complete(null);
+
+        assertThat(first).isCompletedWithValue(null);
+        assertThat(second).isCompletedWithValue(null);
+    }
+
+    @Test
+    void shutdown_whenClientShutdownFailsExceptionally_isVisibleThroughTheCachedFuture() {
+        FileConfiguration yaml = baseYaml();
+        TelegramConfig config = new TelegramConfig(yaml);
+        TelegramClient client = mock(TelegramClient.class);
+        CompletableFuture<Void> termination = new CompletableFuture<>();
+        when(client.shutdown()).thenReturn(termination);
+        AddonRuntime runtime = new AddonRuntime(config, client, mock(NotificationService.class));
+
+        CompletableFuture<Void> first = runtime.shutdown();
+        CompletableFuture<Void> second = runtime.shutdown();
+        RuntimeException failure = new RuntimeException("client shutdown boom");
+        termination.completeExceptionally(failure);
+
+        assertThatThrownBy(() -> first.get(1, TimeUnit.SECONDS)).cause().isSameAs(failure);
+        assertThatThrownBy(() -> second.get(1, TimeUnit.SECONDS)).cause().isSameAs(failure);
+    }
+
+    @Test
     void shutdown_calledAgainAfterFirstCompletes_doesNotHang() throws Exception {
         FileConfiguration yaml = baseYaml();
         TelegramConfig config = new TelegramConfig(yaml);
@@ -266,5 +306,4 @@ class AddonRuntimeTest {
 
         assertThat(runtime.locale().getCode()).isEqualTo("ru");
     }
-
 }
