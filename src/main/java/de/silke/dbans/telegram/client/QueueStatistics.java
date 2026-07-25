@@ -12,6 +12,8 @@ public record QueueStatistics(int capacity, int depth, long dropped) {
         if (dropped < 0) {
             throw new IllegalArgumentException("dropped must not be negative");
         }
+        if (depth > capacity) {
+            throw new IllegalArgumentException("depth must not exceed capacity");
+        }
     }
-
 }
