@@ -1,6 +1,7 @@
 package de.silke.dbans.telegram.application;
 
 import de.silke.dbans.telegram.client.TelegramClient;
+import de.silke.dbans.telegram.client.TelegramClientShuttingDownException;
 import de.silke.dbans.telegram.locale.MessageProvider;
 import de.silke.dbans.telegram.locale.SupportedLocale;
 import me.demro.dlibs.dbans.api.event.*;
@@ -144,7 +145,7 @@ class NotificationServiceTest {
     @Test
     void notify_whenQueueIsShuttingDown_doesNotPropagateException() {
         when(mockClient.sendMessage(anyString()))
-                .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("shut down")));
+                .thenReturn(CompletableFuture.failedFuture(new TelegramClientShuttingDownException("shut down")));
         Punishment punishment = stubPunishment(PunishmentType.JAIL, "JailedSilke", "creative");
 
         service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
@@ -161,7 +162,7 @@ class NotificationServiceTest {
 
     @Test
     void isLifecycleCancellation_classifiesShutdownRelatedFailuresAsLifecycle() {
-        assertThat(NotificationService.isLifecycleCancellation(new IllegalStateException("shut down"))).isTrue();
+        assertThat(NotificationService.isLifecycleCancellation(new TelegramClientShuttingDownException("shut down"))).isTrue();
         assertThat(NotificationService.isLifecycleCancellation(new CancellationException("cancelled"))).isTrue();
     }
 
@@ -171,4 +172,8 @@ class NotificationServiceTest {
         assertThat(NotificationService.isLifecycleCancellation(new java.io.IOException("network down"))).isFalse();
     }
 
+    @Test
+    void isLifecycleCancellation_doesNotTreatUnrelatedIllegalStateExceptionAsLifecycle() {
+        assertThat(NotificationService.isLifecycleCancellation(new IllegalStateException("some programming defect"))).isFalse();
+    }
 }
