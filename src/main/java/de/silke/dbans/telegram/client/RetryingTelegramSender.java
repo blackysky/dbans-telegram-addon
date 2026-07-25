@@ -1,91 +1,68 @@
 package de.silke.dbans.telegram.client;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import de.silke.dbans.telegram.config.TelegramConfig;
-import lombok.experimental.UtilityClass;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.TestOnly;
 
-import java.net.URI;
-import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-final class RetryingTelegramSender implements TelegramDeliverySender {
+final class RetryingTelegramSender implements CancellableTelegramDeliverySender {
 
     private static final Logger log = Logger.getLogger("dbans-telegram-addon");
     private static final int MAX_RETRIES = 3;
     private static final Duration MIN_SEND_INTERVAL = Duration.ofSeconds(1);
-    private static final Set<Integer> RETRYABLE_STATUS_CODES = Set.of(500, 502, 503, 504);
 
-    private final TelegramConfig config;
-    private final String apiBaseUrl;
-    private final TelegramHttpSender httpSender;
+    private final TelegramApiTransport transport;
     private final ScheduledExecutorService scheduler;
-    private final Set<CompletableFuture<?>> pendingScheduled = ConcurrentHashMap.newKeySet();
+    private final Object lock = new Object();
+    private final Map<CompletableFuture<?>, ScheduledFuture<?>> pendingScheduled = new HashMap<>();
+    private boolean cancelled = false;
 
-    RetryingTelegramSender(@NotNull TelegramConfig config, @NotNull String apiBaseUrl,
-                           @NotNull TelegramHttpSender httpSender, @NotNull ScheduledExecutorService scheduler
+    RetryingTelegramSender(@NotNull TelegramApiTransport transport,
+                           @NotNull ScheduledExecutorService scheduler
     ) {
-        this.config = config;
-        this.apiBaseUrl = apiBaseUrl;
-        this.httpSender = httpSender;
-        this.scheduler = scheduler;
-    }
-
-    @Contract(pure = true)
-    static @NotNull TelegramHttpSender defaultHttpSender() {
-        return request -> HttpClientHolder.INSTANCE.sendAsync(request, HttpResponse.BodyHandlers.ofString());
-    }
-
-    private static HttpClient createDefaultHttpClient() {
-        return HttpClient.newBuilder()
-                         .connectTimeout(Duration.ofSeconds(5))
-                         .build();
-    }
-
-    private static int parseRetryAfterSeconds(@NotNull String body) {
-        try {
-            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-            JsonObject params = root.getAsJsonObject("parameters");
-            if (params != null) {
-                JsonElement retryAfter = params.get("retry_after");
-                if (retryAfter != null) {
-                    return retryAfter.getAsInt();
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return 30;
+        this.transport = Objects.requireNonNull(transport, "transport");
+        this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
     }
 
     @Contract(value = " -> new", pure = true)
-    private static @NotNull CancellationException schedulerShutdownException() {
-        return new CancellationException("Telegram delivery scheduler is shut down");
+    private static @NotNull CancellationException cancellationException() {
+        return new CancellationException("Telegram delivery sender is permanently cancelled");
     }
 
     @Override
     public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+        synchronized (lock) {
+            if (cancelled) {
+                return CompletableFuture.failedFuture(cancellationException());
+            }
+        }
         return pacedSend(chatId, text);
     }
 
     @Override
     public void cancelAllPending() {
-        List<CompletableFuture<?>> batch;
-        while (!(batch = List.copyOf(pendingScheduled)).isEmpty()) {
-            for (CompletableFuture<?> pending : batch) {
-                pending.completeExceptionally(schedulerShutdownException());
+        List<Map.Entry<CompletableFuture<?>, ScheduledFuture<?>>> toCancel;
+        synchronized (lock) {
+            if (cancelled) {
+                return;
             }
+            cancelled = true;
+            toCancel = List.copyOf(pendingScheduled.entrySet());
+            pendingScheduled.clear();
+        }
+        for (Map.Entry<CompletableFuture<?>, ScheduledFuture<?>> entry : toCancel) {
+            entry.getValue().cancel(false);
+            entry.getKey().completeExceptionally(cancellationException());
         }
     }
 
@@ -98,50 +75,69 @@ final class RetryingTelegramSender implements TelegramDeliverySender {
     }
 
     private @NotNull CompletableFuture<Void> delay() {
+        return scheduleDelayed(
+                MIN_SEND_INTERVAL.toMillis(),
+                TimeUnit.MILLISECONDS,
+                future -> future.complete(null)
+        );
+    }
+
+    private @NotNull CompletableFuture<Void> scheduleDelayed(
+            long delay, @NotNull TimeUnit unit, @NotNull Consumer<CompletableFuture<Void>> onFire
+    ) {
         CompletableFuture<Void> future = new CompletableFuture<>();
-        trackPending(future);
-        scheduleOrFail(future, () -> future.complete(null), MIN_SEND_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+        synchronized (lock) {
+            if (cancelled) {
+                return CompletableFuture.failedFuture(cancellationException());
+            }
+            ScheduledFuture<?> scheduledFuture;
+            try {
+                scheduledFuture = scheduler.schedule(() -> runIfNotCancelled(future, onFire), delay, unit);
+            } catch (RejectedExecutionException e) {
+                return CompletableFuture.failedFuture(cancellationException());
+            }
+            pendingScheduled.put(future, scheduledFuture);
+        }
+        future.whenComplete((v, ex) -> removeFromPending(future));
         return future;
     }
 
-    private void trackPending(@NotNull CompletableFuture<?> future) {
-        pendingScheduled.add(future);
-        future.whenComplete((v, ex) -> pendingScheduled.remove(future));
+    private void runIfNotCancelled(@NotNull CompletableFuture<Void> future,
+                                   @NotNull Consumer<CompletableFuture<Void>> onFire
+    ) {
+        synchronized (lock) {
+            if (cancelled) {
+                return;
+            }
+        }
+        onFire.accept(future);
     }
 
-    private void scheduleOrFail(@NotNull CompletableFuture<?> future, @NotNull Runnable task,
-                                long delay, @NotNull TimeUnit unit
-    ) {
-        try {
-            scheduler.schedule(task, delay, unit);
-        } catch (RejectedExecutionException e) {
-            future.completeExceptionally(schedulerShutdownException());
+    private void removeFromPending(@NotNull CompletableFuture<?> future) {
+        synchronized (lock) {
+            pendingScheduled.remove(future);
         }
     }
 
-    private @NotNull CompletableFuture<Void> sendMessage(@NotNull String chatId,
-                                                         @NotNull String text,
-                                                         int attempt
-    ) {
-        String url = apiBaseUrl + "/bot" + config.getToken() + "/sendMessage";
-        String body = "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
-                      + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8);
+    @Contract(pure = true)
+    @TestOnly
+    int pendingScheduledCountForTesting() {
+        synchronized (lock) {
+            return pendingScheduled.size();
+        }
+    }
 
-        HttpRequest request = HttpRequest.newBuilder()
-                                         .uri(URI.create(url))
-                                         .header("Content-Type", "application/x-www-form-urlencoded")
-                                         .timeout(Duration.ofSeconds(10))
-                                         .POST(HttpRequest.BodyPublishers.ofString(
-                                                 body,
-                                                 StandardCharsets.UTF_8
-                                         ))
-                                         .build();
-
-        return httpSender.send(request)
-                         .handle((response, ex) -> ex != null
-                                 ? retryOnNetworkError(chatId, text, attempt, ex)
-                                 : handleResponse(chatId, text, response, attempt))
-                         .thenCompose(future -> future);
+    private @NotNull CompletableFuture<Void> sendMessage(@NotNull String chatId, @NotNull String text, int attempt) {
+        CompletableFuture<HttpResponse<String>> responseFuture;
+        try {
+            responseFuture = transport.send(chatId, text);
+        } catch (RuntimeException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+        return responseFuture.handle((response, ex) -> ex != null
+                                     ? retryOnNetworkError(chatId, text, attempt, ex)
+                                     : handleResponse(chatId, text, response, attempt))
+                             .thenCompose(future -> future);
     }
 
     private @NotNull CompletableFuture<Void> retryOnNetworkError(
@@ -156,65 +152,64 @@ final class RetryingTelegramSender implements TelegramDeliverySender {
         return scheduleRetry(chatId, text, attempt, MIN_SEND_INTERVAL.toSeconds());
     }
 
-    @SuppressWarnings("MethodWithMultipleReturnPoints")
     private @NotNull CompletableFuture<Void> handleResponse(
-            @NotNull String chatId,
-            @NotNull String text,
-            @NotNull HttpResponse<String> response,
-            int attempt
+            @NotNull String chatId, @NotNull String text, @NotNull HttpResponse<String> response, int attempt
     ) {
-        int status = response.statusCode();
-        if (status == 200) {
-            return CompletableFuture.completedFuture(null);
-        }
+        TelegramHttpResponseClassifier.Result result = TelegramHttpResponseClassifier.classify(response.statusCode(), response.body());
+        return switch (result.classification()) {
+            case SUCCESS -> CompletableFuture.completedFuture(null);
+            case RATE_LIMITED -> handleRateLimited(chatId, text, attempt, result);
+            case TEMPORARY_FAILURE -> handleTemporaryFailure(chatId, text, attempt, result);
+            case PERMANENT_FAILURE -> handlePermanentFailure(chatId, result, response.body());
+        };
+    }
 
-        if (status == 429) {
-            if (attempt >= MAX_RETRIES) {
-                log.warning("Telegram rate limit hit. Message to " + chatId + " dropped after " + MAX_RETRIES + " retries");
-                return CompletableFuture.failedFuture(new TelegramApiException(status));
-            }
-
-            int retryAfter = parseRetryAfterSeconds(response.body());
-            log.warning("Telegram rate limit for " + chatId + " (retry_after=" + retryAfter + "s). Retrying in "
-                        + retryAfter + "s (attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
-            return scheduleRetry(chatId, text, attempt, retryAfter);
+    private @NotNull CompletableFuture<Void> handleRateLimited(
+            @NotNull String chatId, @NotNull String text, int attempt,
+            @NotNull TelegramHttpResponseClassifier.Result result
+    ) {
+        if (attempt >= MAX_RETRIES) {
+            log.warning("Telegram rate limit hit. Message to " + chatId + " dropped after " + MAX_RETRIES + " retries");
+            return CompletableFuture.failedFuture(new TelegramApiException(result.statusCode()));
         }
+        int retryAfter = result.retryAfterSeconds();
+        log.warning("Telegram rate limit for " + chatId + " (retry_after=" + retryAfter + "s). Retrying in "
+                    + retryAfter + "s (attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
+        return scheduleRetry(chatId, text, attempt, retryAfter);
+    }
 
-        if (RETRYABLE_STATUS_CODES.contains(status)) {
-            if (attempt >= MAX_RETRIES) {
-                log.warning("Telegram server error " + status + ". Message to " + chatId + " dropped after " + MAX_RETRIES + " retries");
-                return CompletableFuture.failedFuture(new TelegramApiException(status));
-            }
-            log.warning("Telegram server error " + status + " for " + chatId + ". Retrying "
-                        + "(attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
-            return scheduleRetry(chatId, text, attempt, MIN_SEND_INTERVAL.toSeconds());
+    private @NotNull CompletableFuture<Void> handleTemporaryFailure(
+            @NotNull String chatId, @NotNull String text, int attempt,
+            @NotNull TelegramHttpResponseClassifier.Result result
+    ) {
+        if (attempt >= MAX_RETRIES) {
+            log.warning("Telegram server error " + result.statusCode() + ". Message to " + chatId
+                        + " dropped after " + MAX_RETRIES + " retries");
+            return CompletableFuture.failedFuture(new TelegramApiException(result.statusCode()));
         }
-        log.warning("Telegram API returned unexpected status " + status + " for " + chatId + ": " + response.body());
-        return CompletableFuture.failedFuture(new TelegramApiException(status));
+        log.warning("Telegram server error " + result.statusCode() + " for " + chatId + ". Retrying "
+                    + "(attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
+        return scheduleRetry(chatId, text, attempt, MIN_SEND_INTERVAL.toSeconds());
+    }
+
+    private @NotNull CompletableFuture<Void> handlePermanentFailure(
+            @NotNull String chatId, @NotNull TelegramHttpResponseClassifier.Result result, @NotNull String body
+    ) {
+        log.warning("Telegram API returned unexpected status " + result.statusCode() + " for " + chatId + ": " + body);
+        return CompletableFuture.failedFuture(new TelegramApiException(result.statusCode()));
     }
 
     private @NotNull CompletableFuture<Void> scheduleRetry(
             @NotNull String chatId, @NotNull String text, int attempt, long delaySeconds
     ) {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        trackPending(future);
-        scheduleOrFail(future, () -> sendMessage(chatId, text, attempt + 1)
-                               .whenComplete((v, ex) -> {
-                                   if (ex != null) {
-                                       future.completeExceptionally(ex);
-                                   } else {
-                                       future.complete(null);
-                                   }
-                               }),
-                       delaySeconds, TimeUnit.SECONDS
-        );
-        return future;
+        return scheduleDelayed(delaySeconds, TimeUnit.SECONDS, future ->
+                sendMessage(chatId, text, attempt + 1)
+                        .whenComplete((v, ex) -> {
+                            if (ex != null) {
+                                future.completeExceptionally(ex);
+                            } else {
+                                future.complete(null);
+                            }
+                        }));
     }
-
-    @UtilityClass
-    private static final class HttpClientHolder {
-
-        private static final HttpClient INSTANCE = createDefaultHttpClient();
-    }
-
 }
