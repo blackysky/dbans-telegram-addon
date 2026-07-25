@@ -4,10 +4,12 @@ import de.silke.dbans.telegram.config.QueueOverflowPolicy;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
@@ -22,29 +24,43 @@ final class ChatDeliveryQueue {
     private final ArrayDeque<QueueItem> items = new ArrayDeque<>();
     private final List<CompletableFuture<Void>> drainWaiters = new ArrayList<>();
     private final AtomicLong droppedCount = new AtomicLong();
-    private boolean accepting = true;
+    private QueueState state = QueueState.ACCEPTING;
+    private QueueItem activeItem;
+
+    /**
+     * Used after delivery attempt was selected, but
+     * before the sender is invoked.
+     */
+    @TestOnly
+    private volatile Runnable beforeInvokeDeliverHookForTesting = () -> {
+    };
 
     ChatDeliveryQueue(@NotNull String chatId, int capacity, @NotNull QueueOverflowPolicy overflowPolicy,
                       @NotNull TelegramDeliverySender sender
     ) {
-        this.chatId = chatId;
+        this.chatId = Objects.requireNonNull(chatId, "chatId");
+        if (capacity < 1) {
+            throw new IllegalArgumentException("capacity must be at least 1");
+        }
         this.capacity = capacity;
-        this.overflowPolicy = overflowPolicy;
-        this.sender = sender;
+        this.overflowPolicy = Objects.requireNonNull(overflowPolicy, "overflowPolicy");
+        this.sender = Objects.requireNonNull(sender, "sender");
     }
 
     @Contract(value = " -> new", pure = true)
-    private static @NotNull IllegalStateException shutdownException() {
-        return new IllegalStateException("TelegramClient is shutdown and no longer accepts messages");
+    private static @NotNull TelegramClientShuttingDownException shutdownException() {
+        return new TelegramClientShuttingDownException(
+                "Telegram chat queue is shutting down and no longer accepts messages");
     }
 
     @NotNull CompletableFuture<Void> submit(@NotNull String text) {
+        Objects.requireNonNull(text, "text");
         CompletableFuture<Void> future = new CompletableFuture<>();
         Throwable rejection = null;
         boolean startNow = false;
 
         synchronized (lock) {
-            if (!accepting) {
+            if (state != QueueState.ACCEPTING) {
                 rejection = shutdownException();
             } else if (items.size() >= capacity) {
                 droppedCount.incrementAndGet();
@@ -72,26 +88,52 @@ final class ChatDeliveryQueue {
     private void startNext() {
         QueueItem head;
         synchronized (lock) {
+            if (state == QueueState.FORCIBLY_STOPPED) {
+                return;
+            }
             head = items.peek();
+            if (head == null || head.future().isDone()) {
+                return;
+            }
+            activeItem = head;
         }
-        if (head != null && !head.future().isDone()) {
-            sender.deliver(chatId, head.text())
-                  .whenComplete((v, ex) -> onDeliveryComplete(head, ex));
+        beforeInvokeDeliverHookForTesting.run();
+        invokeDeliver(head);
+    }
+
+    private void invokeDeliver(@NotNull QueueItem item) {
+        synchronized (lock) {
+            if (state == QueueState.FORCIBLY_STOPPED || activeItem != item) {
+                return;
+            }
         }
+        CompletableFuture<Void> deliveryFuture;
+        try {
+            deliveryFuture = sender.deliver(chatId, item.text());
+        } catch (RuntimeException e) {
+            onDeliveryComplete(item, e);
+            return;
+        }
+        deliveryFuture.whenComplete((v, ex) -> onDeliveryComplete(item, ex));
     }
 
     private void onDeliveryComplete(@NotNull QueueItem item, @Nullable Throwable ex) {
-        boolean idle;
+        boolean idle = false;
+        boolean advance = false;
         synchronized (lock) {
-            items.poll();
-            idle = items.isEmpty();
+            if (activeItem == item && items.peek() == item) {
+                items.poll();
+                activeItem = null;
+                idle = items.isEmpty();
+                advance = !idle;
+            }
         }
         completeResult(item.future(), ex);
 
-        if (idle) {
-            completeDrainWaiters();
-        } else {
+        if (advance) {
             startNext();
+        } else if (idle) {
+            completeDrainWaiters();
         }
     }
 
@@ -106,7 +148,9 @@ final class ChatDeliveryQueue {
     @Contract(mutates = "this")
     void stopAccepting() {
         synchronized (lock) {
-            accepting = false;
+            if (state == QueueState.ACCEPTING) {
+                state = QueueState.DRAINING;
+            }
         }
     }
 
@@ -124,8 +168,10 @@ final class ChatDeliveryQueue {
     int forceCancel() {
         List<QueueItem> remaining;
         synchronized (lock) {
+            state = QueueState.FORCIBLY_STOPPED;
             remaining = List.copyOf(items);
             items.clear();
+            activeItem = null;
         }
         for (QueueItem item : remaining) {
             item.future().completeExceptionally(
@@ -156,8 +202,19 @@ final class ChatDeliveryQueue {
         }
     }
 
+    @Contract(mutates = "this")
+    @TestOnly
+    void setBeforeInvokeDeliverHookForTesting(@NotNull Runnable hook) {
+        this.beforeInvokeDeliverHookForTesting = Objects.requireNonNull(hook, "hook");
+    }
+
+    private enum QueueState {
+        ACCEPTING,
+        DRAINING,
+        FORCIBLY_STOPPED
+    }
+
     private record QueueItem(@NotNull String text, @NotNull CompletableFuture<Void> future) {
 
     }
-
 }

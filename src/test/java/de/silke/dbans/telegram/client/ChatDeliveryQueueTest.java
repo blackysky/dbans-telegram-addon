@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -224,7 +223,7 @@ class ChatDeliveryQueueTest {
         CompletableFuture<Void> result = queue.submit("a");
 
         assertThat(result).isCompletedExceptionally();
-        assertThatThrownBy(result::get).cause().isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(result::get).cause().isInstanceOf(TelegramClientShuttingDownException.class);
         assertThat(sender.deliveredText).isEmpty();
         assertThat(queue.statistics().dropped()).isEqualTo(0);
     }
@@ -247,11 +246,98 @@ class ChatDeliveryQueueTest {
         assertThat(queue.statistics().depth()).isEqualTo(0);
     }
 
+    @Test
+    void constructor_rejectsNonPositiveCapacity() {
+        ControllableSender sender = new ControllableSender();
+        assertThatThrownBy(() -> new ChatDeliveryQueue(CHAT_ID, 0, QueueOverflowPolicy.DROP_NEWEST, sender))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new ChatDeliveryQueue(CHAT_ID, -1, QueueOverflowPolicy.DROP_NEWEST, sender))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void constructor_rejectsNullArguments() {
+        ControllableSender sender = new ControllableSender();
+        assertThatThrownBy(() -> new ChatDeliveryQueue(null, 1, QueueOverflowPolicy.DROP_NEWEST, sender))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new ChatDeliveryQueue(CHAT_ID, 1, null, sender))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new ChatDeliveryQueue(CHAT_ID, 1, QueueOverflowPolicy.DROP_NEWEST, null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void forcedCancellation_betweenHeadSelectionAndSenderInvocation_preventsDeliveryFromStarting() {
+        ControllableSender sender = new ControllableSender();
+        ChatDeliveryQueue queue = queue(5, sender);
+        queue.setBeforeInvokeDeliverHookForTesting(queue::forceCancel);
+
+        CompletableFuture<Void> result = queue.submit("a");
+
+        assertThat(sender.deliveredText).isEmpty();
+        assertThat(result).isCompletedExceptionally();
+        assertThatThrownBy(result::get).isInstanceOf(CancellationException.class);
+        assertThat(queue.statistics().depth()).isEqualTo(0);
+    }
+
+    @Test
+    void staleDeliveryCallback_afterForcedCancellation_doesNotCorruptQueueState() {
+        ControllableSender sender = new ControllableSender();
+        ChatDeliveryQueue queue = queue(5, sender);
+        CompletableFuture<Void> first = queue.submit("a");
+        CompletableFuture<Void> second = queue.submit("b");
+
+        queue.forceCancel();
+        sender.futureFor(0).complete(null);
+
+        assertThat(first).isCompletedExceptionally();
+        assertThatThrownBy(first::get).isInstanceOf(CancellationException.class);
+        assertThat(second).isCompletedExceptionally();
+        assertThat(sender.deliveredText).containsExactly("a");
+        assertThat(queue.statistics().depth()).isEqualTo(0);
+    }
+
+    @Test
+    void synchronousExceptionFromSender_failsOnlyThatItemAndQueueContinuesWithNextItem() {
+        ThrowingThenPendingSender sender = new ThrowingThenPendingSender();
+        ChatDeliveryQueue queue = new ChatDeliveryQueue(CHAT_ID, 5, QueueOverflowPolicy.DROP_NEWEST, sender);
+
+        CompletableFuture<Void> first = queue.submit("a");
+        assertThat(first).isCompletedExceptionally();
+        assertThatThrownBy(first::get).cause().isInstanceOf(RuntimeException.class).hasMessage("synchronous boom");
+
+        CompletableFuture<Void> second = queue.submit("b");
+        CompletableFuture<Void> drain = queue.drain();
+        assertThat(second).isNotDone();
+        assertThat(drain).isNotDone();
+
+        sender.secondFuture.complete(null);
+
+        assertThat(second).isCompletedWithValue(null);
+        assertThat(drain).isCompletedWithValue(null);
+        assertThat(queue.statistics().depth()).isEqualTo(0);
+    }
+
+    private static final class ThrowingThenPendingSender implements TelegramDeliverySender {
+
+        private int calls = 0;
+        private CompletableFuture<Void> secondFuture;
+
+        @Override
+        public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+            calls++;
+            if (calls == 1) {
+                throw new RuntimeException("synchronous boom");
+            }
+            secondFuture = new CompletableFuture<>();
+            return secondFuture;
+        }
+    }
+
     private static final class ControllableSender implements TelegramDeliverySender {
 
         private final List<String> deliveredText = Collections.synchronizedList(new ArrayList<>());
         private final List<CompletableFuture<Void>> pending = Collections.synchronizedList(new ArrayList<>());
-        private final AtomicInteger cancelCalls = new AtomicInteger();
 
         @Override
         public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
@@ -261,14 +347,8 @@ class ChatDeliveryQueueTest {
             return future;
         }
 
-        @Override
-        public void cancelAllPending() {
-            cancelCalls.incrementAndGet();
-        }
-
         @NotNull CompletableFuture<Void> futureFor(int index) {
             return pending.get(index);
         }
-
     }
 }
