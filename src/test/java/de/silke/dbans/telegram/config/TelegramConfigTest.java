@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TelegramConfigTest {
 
@@ -148,6 +149,51 @@ class TelegramConfigTest {
         TelegramConfig config = new TelegramConfig(yaml);
 
         assertThat(config.queue().shutdownTimeout()).isEqualTo(Duration.ZERO);
+        assertThat(config.diagnostics().warnings()).isEmpty();
+    }
+
+    @Test
+    void queueSettings_compactConstructor_rejectsNonPositiveCapacityEvenIfHandCrafted() {
+        assertThatThrownBy(() -> new TelegramConfig.QueueSettings(0, QueueOverflowPolicy.DROP_NEWEST, Duration.ZERO))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new TelegramConfig.QueueSettings(-1, QueueOverflowPolicy.DROP_NEWEST, Duration.ZERO))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void queueSettings_compactConstructor_rejectsNullOverflowPolicy() {
+        assertThatThrownBy(() -> new TelegramConfig.QueueSettings(1, null, Duration.ZERO))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void queueSettings_compactConstructor_rejectsNullShutdownTimeout() {
+        assertThatThrownBy(() -> new TelegramConfig.QueueSettings(1, QueueOverflowPolicy.DROP_NEWEST, null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void queueSettings_compactConstructor_rejectsNegativeShutdownTimeout() {
+        assertThatThrownBy(() -> new TelegramConfig.QueueSettings(1, QueueOverflowPolicy.DROP_NEWEST, Duration.ofSeconds(-1)))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void queueSettings_compactConstructor_acceptsZeroShutdownTimeout() {
+        TelegramConfig.QueueSettings settings =
+                new TelegramConfig.QueueSettings(1, QueueOverflowPolicy.DROP_NEWEST, Duration.ZERO);
+
+        assertThat(settings.shutdownTimeout()).isEqualTo(Duration.ZERO);
+    }
+
+    @Test
+    void queueOverflowPolicy_isCaseAndLocaleInsensitive() {
+        FileConfiguration yaml = baseYaml();
+        yaml.set("queue.overflow-policy", "drop_newest");
+
+        TelegramConfig config = new TelegramConfig(yaml);
+
+        assertThat(config.queue().overflowPolicy()).isEqualTo(QueueOverflowPolicy.DROP_NEWEST);
         assertThat(config.diagnostics().warnings()).isEmpty();
     }
 }

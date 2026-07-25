@@ -9,10 +9,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.time.Duration;
 import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.EnumSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.logging.Logger;
 
 @Getter
@@ -43,7 +40,7 @@ public class TelegramConfig {
         String localeCode = config.getString("locale", "en").trim();
         this.locale = SupportedLocale.fromCode(localeCode);
         if (!this.locale.getCode().equalsIgnoreCase(localeCode)) {
-            warnings.add("Unknown locale '" + localeCode + "', falling back to " + this.locale.getCode());
+            warnings.add("Unknown locale '" + localeCode + "', falling back to '" + this.locale.getCode() + "'");
         }
 
         this.timezone = parseZone(config.getString("timezone", "UTC").trim(), warnings);
@@ -72,7 +69,7 @@ public class TelegramConfig {
                 continue;
             }
             try {
-                types.add(PunishmentType.valueOf(trimmed.toUpperCase()));
+                types.add(PunishmentType.valueOf(trimmed.toUpperCase(Locale.ROOT)));
             } catch (IllegalArgumentException e) {
                 String message = "Unknown punishment type in notifications.ignored-types: " + name;
                 log.warning(message);
@@ -96,7 +93,7 @@ public class TelegramConfig {
                                                                     @NotNull List<String> warnings
     ) {
         try {
-            return QueueOverflowPolicy.valueOf(raw.trim().toUpperCase());
+            return QueueOverflowPolicy.valueOf(raw.trim().toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
             String message = "Unknown queue.overflow-policy '" + raw + "', falling back to " + QueueOverflowPolicy.DROP_NEWEST;
             log.warning(message);
@@ -182,7 +179,6 @@ public class TelegramConfig {
         public NotificationSettings {
             ignoredTypes = Set.copyOf(ignoredTypes);
         }
-
     }
 
     public record QueueSettings(
@@ -191,6 +187,16 @@ public class TelegramConfig {
             @NotNull Duration shutdownTimeout
     ) {
 
+        public QueueSettings {
+            if (capacity <= 0) {
+                throw new IllegalArgumentException("capacity must be greater than zero");
+            }
+            Objects.requireNonNull(overflowPolicy, "overflowPolicy");
+            Objects.requireNonNull(shutdownTimeout, "shutdownTimeout");
+            if (shutdownTimeout.isNegative()) {
+                throw new IllegalArgumentException("shutdownTimeout must not be negative");
+            }
+        }
     }
 
     public record Diagnostics(@NotNull List<String> warnings) {
@@ -199,7 +205,5 @@ public class TelegramConfig {
         public Diagnostics {
             warnings = List.copyOf(warnings);
         }
-
     }
-
 }
