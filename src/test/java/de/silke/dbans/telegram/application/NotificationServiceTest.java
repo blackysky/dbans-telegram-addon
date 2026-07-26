@@ -1,6 +1,7 @@
 package de.silke.dbans.telegram.application;
 
 import de.silke.dbans.telegram.client.TelegramClient;
+import de.silke.dbans.telegram.client.TelegramClientShuttingDownException;
 import de.silke.dbans.telegram.locale.MessageProvider;
 import de.silke.dbans.telegram.locale.SupportedLocale;
 import me.demro.dlibs.dbans.api.event.*;
@@ -14,10 +15,12 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.io.File;
+import java.io.IOException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -140,4 +143,38 @@ class NotificationServiceTest {
         service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
     }
 
+    @Test
+    void notify_whenQueueIsShuttingDown_doesNotPropagateException() {
+        when(mockClient.sendMessage(anyString()))
+                .thenReturn(CompletableFuture.failedFuture(new TelegramClientShuttingDownException("shut down")));
+        Punishment punishment = stubPunishment(PunishmentType.JAIL, "JailedSilke", "creative");
+
+        service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
+    }
+
+    @Test
+    void notify_whenForciblyCancelledByShutdown_doesNotPropagateException() {
+        when(mockClient.sendMessage(anyString()))
+                .thenReturn(CompletableFuture.failedFuture(new CancellationException("cancelled")));
+        Punishment punishment = stubPunishment(PunishmentType.JAIL, "JailedSilke", "creative");
+
+        service.notify(new PunishmentExpireEvent(punishment, EventOrigin.AUTO, Instant.now(), true));
+    }
+
+    @Test
+    void isLifecycleCancellation_classifiesShutdownRelatedFailuresAsLifecycle() {
+        assertThat(NotificationService.isLifecycleCancellation(new TelegramClientShuttingDownException("shut down"))).isTrue();
+        assertThat(NotificationService.isLifecycleCancellation(new CancellationException("cancelled"))).isTrue();
+    }
+
+    @Test
+    void isLifecycleCancellation_classifiesRealDeliveryFailuresAsNotLifecycle() {
+        assertThat(NotificationService.isLifecycleCancellation(new RuntimeException("boom"))).isFalse();
+        assertThat(NotificationService.isLifecycleCancellation(new IOException("network down"))).isFalse();
+    }
+
+    @Test
+    void isLifecycleCancellation_doesNotTreatUnrelatedIllegalStateExceptionAsLifecycle() {
+        assertThat(NotificationService.isLifecycleCancellation(new IllegalStateException("some programming defect"))).isFalse();
+    }
 }

@@ -2,6 +2,7 @@ package de.silke.dbans.telegram.lifecycle;
 
 import de.silke.dbans.telegram.application.NotificationService;
 import de.silke.dbans.telegram.client.TelegramClient;
+import de.silke.dbans.telegram.client.TelegramClientShuttingDownException;
 import de.silke.dbans.telegram.config.TelegramConfig;
 import de.silke.dbans.telegram.locale.SupportedLocale;
 import lombok.AccessLevel;
@@ -23,6 +24,8 @@ class AddonRuntime {
     private final TelegramClient client;
     private final NotificationService notificationService;
     private final AtomicBoolean stopped = new AtomicBoolean();
+    private final Object shutdownLock = new Object();
+    private volatile CompletableFuture<Void> shutdownFuture;
 
     public @NotNull SupportedLocale locale() {
         return config.getLocale();
@@ -58,15 +61,24 @@ class AddonRuntime {
 
     @NotNull CompletableFuture<Void> sendTestMessage(@NotNull String text) {
         if (stopped.get()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("AddonRuntime is stopped"));
+            return CompletableFuture.failedFuture(
+                    new TelegramClientShuttingDownException("dbans-telegram-addon runtime is stopped and no longer accepts messages")
+            );
         }
         return client.sendMessage(text);
     }
 
-    void shutdown() {
-        if (stopped.compareAndSet(false, true)) {
-            client.shutdown();
+    @NotNull CompletableFuture<Void> shutdown() {
+        stopped.set(true);
+        CompletableFuture<Void> existing = shutdownFuture;
+        if (existing != null) {
+            return existing;
+        }
+        synchronized (shutdownLock) {
+            if (shutdownFuture == null) {
+                shutdownFuture = client.shutdown();
+            }
+            return shutdownFuture;
         }
     }
-
 }

@@ -1,34 +1,54 @@
 package de.silke.dbans.telegram.application;
 
 import de.silke.dbans.telegram.client.TelegramClient;
+import de.silke.dbans.telegram.client.TelegramClientShuttingDownException;
+import de.silke.dbans.telegram.client.TelegramQueueFullException;
 import de.silke.dbans.telegram.locale.MessageKey;
 import de.silke.dbans.telegram.locale.MessageProvider;
 import de.silke.dbans.telegram.model.PunishmentSnapshot;
 import me.demro.dlibs.dbans.api.event.*;
 import me.demro.dlibs.dbans.api.punishment.Punishment;
+import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class NotificationService {
 
     private static final Logger log = Logger.getLogger("dbans-telegram-addon");
+    private static final Duration OVERFLOW_LOG_INTERVAL = Duration.ofSeconds(30);
 
     private final TelegramClient client;
     private final MessageProvider messageProvider;
     private final DateTimeFormatter dateFormat;
+    private final Map<String, Instant> lastOverflowLogAt = new ConcurrentHashMap<>();
 
     public NotificationService(TelegramClient client, MessageProvider messageProvider, ZoneId timezone) {
         this.client = client;
         this.messageProvider = messageProvider;
         this.dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z").withZone(timezone);
+    }
+
+    @Contract(pure = true)
+    static boolean isLifecycleCancellation(@NotNull Throwable cause) {
+        return cause instanceof TelegramClientShuttingDownException || cause instanceof CancellationException;
+    }
+
+    private static @NotNull Throwable unwrap(@NotNull Throwable throwable) {
+        return throwable instanceof CompletionException && throwable.getCause() != null
+                ? throwable.getCause()
+                : throwable;
     }
 
     public void notify(@NotNull PunishmentCreateEvent event) {
@@ -91,9 +111,34 @@ public class NotificationService {
         String message = messageProvider.format(key, toVars(snapshot));
         client.sendMessage(message)
               .exceptionally(ex -> {
-                  log.log(Level.WARNING, "Failed to deliver Telegram notification", ex);
+                  logFailure(unwrap(ex));
                   return null;
               });
+    }
+
+    private void logFailure(@NotNull Throwable cause) {
+        if (isLifecycleCancellation(cause)) {
+            log.log(Level.FINE, "Telegram notification skipped: addon is shutting down", cause);
+        } else if (cause instanceof TelegramQueueFullException overflow) {
+            logOverflow(overflow);
+        } else {
+            log.log(Level.WARNING, "Failed to deliver Telegram notification", cause);
+        }
+    }
+
+    private void logOverflow(@NotNull TelegramQueueFullException overflow) {
+        String chatId = overflow.chatId();
+        Instant now = Instant.now();
+        Instant previous = lastOverflowLogAt.putIfAbsent(chatId, now);
+        if (previous != null) {
+            if (Duration.between(previous, now).compareTo(OVERFLOW_LOG_INTERVAL) < 0) {
+                return;
+            }
+            lastOverflowLogAt.put(chatId, now);
+        }
+        log.warning("Telegram delivery queue full for chat " + chatId + " (capacity=" + overflow.capacity()
+                    + "); notification dropped. Further overflow warnings for this chat are suppressed for "
+                    + OVERFLOW_LOG_INTERVAL.toSeconds() + "s; use queue statistics for the exact drop count");
     }
 
     private @NotNull Map<String, String> toVars(@NotNull PunishmentSnapshot snapshot) {
@@ -129,5 +174,4 @@ public class NotificationService {
     private @NotNull String formatInstant(@Nullable Instant instant) {
         return instant != null ? dateFormat.format(instant) : messageProvider.permanent();
     }
-
 }

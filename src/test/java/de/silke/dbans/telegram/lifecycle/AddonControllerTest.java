@@ -42,6 +42,7 @@ class AddonControllerTest {
     private AddonRuntime validRuntime() {
         AddonRuntime runtime = mock(AddonRuntime.class);
         when(runtime.locale()).thenReturn(de.silke.dbans.telegram.locale.SupportedLocale.EN);
+        when(runtime.shutdown()).thenReturn(CompletableFuture.completedFuture(null));
         return runtime;
     }
 
