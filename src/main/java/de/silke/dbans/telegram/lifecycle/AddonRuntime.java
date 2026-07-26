@@ -2,6 +2,7 @@ package de.silke.dbans.telegram.lifecycle;
 
 import de.silke.dbans.telegram.application.NotificationService;
 import de.silke.dbans.telegram.client.TelegramClient;
+import de.silke.dbans.telegram.client.TelegramClientShuttingDownException;
 import de.silke.dbans.telegram.config.TelegramConfig;
 import de.silke.dbans.telegram.locale.SupportedLocale;
 import lombok.AccessLevel;
@@ -60,7 +61,9 @@ class AddonRuntime {
 
     @NotNull CompletableFuture<Void> sendTestMessage(@NotNull String text) {
         if (stopped.get()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("AddonRuntime is stopped"));
+            return CompletableFuture.failedFuture(
+                    new TelegramClientShuttingDownException("dbans-telegram-addon runtime is stopped and no longer accepts messages")
+            );
         }
         return client.sendMessage(text);
     }

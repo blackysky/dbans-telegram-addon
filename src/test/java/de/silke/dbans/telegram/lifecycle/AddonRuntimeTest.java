@@ -2,6 +2,7 @@ package de.silke.dbans.telegram.lifecycle;
 
 import de.silke.dbans.telegram.application.NotificationService;
 import de.silke.dbans.telegram.client.TelegramClient;
+import de.silke.dbans.telegram.client.TelegramClientShuttingDownException;
 import de.silke.dbans.telegram.config.TelegramConfig;
 import me.demro.dlibs.dbans.api.event.*;
 import me.demro.dlibs.dbans.api.punishment.Punishment;
@@ -210,7 +211,7 @@ class AddonRuntimeTest {
         CompletableFuture<Void> result = runtime.sendTestMessage("hello");
 
         assertThatThrownBy(() -> result.get(1, TimeUnit.SECONDS))
-                .cause().isInstanceOf(IllegalStateException.class);
+                .cause().isInstanceOf(TelegramClientShuttingDownException.class);
         verify(client, never()).sendMessage(any());
     }
 
