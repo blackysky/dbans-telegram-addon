@@ -86,6 +86,25 @@ class TelegramClientTest {
         }
     }
 
+    private static @NotNull CancellableTelegramDeliverySender getFake(CountDownLatch cancelEntered,
+                                                                      CountDownLatch releaseCancel
+    ) {
+        CompletableFuture<Void> stuck1 = new CompletableFuture<>();
+        CompletableFuture<Void> stuck2 = new CompletableFuture<>();
+        return new CancellableTelegramDeliverySender() {
+            @Override
+            public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+                return "1".equals(chatId) ? stuck1 : stuck2;
+            }
+
+            @Override
+            public void cancelAllPending() {
+                cancelEntered.countDown();
+                awaitQuietly(releaseCancel);
+            }
+        };
+    }
+
     private void startServer(IntFunction<StubResponse> responder) throws Exception {
         requestCount = new AtomicInteger();
         server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
@@ -518,7 +537,9 @@ class TelegramClientTest {
         Thread shutdowner = new Thread(client::shutdown);
         shutdowner.start();
 
-        Thread.sleep(50);
+        while (!client.hasThreadsQueuedForLifecycleLockForTesting()) {
+            Thread.onSpinWait();
+        }
         resume.countDown();
 
         sender.join(5000);
@@ -527,6 +548,256 @@ class TelegramClientTest {
         assertThat(broadcastResult.get()).isNotNull();
         broadcastResult.get().get(3, TimeUnit.SECONDS);
         assertThat(deliverCalls.get()).isEqualTo(2);
+    }
+
+    @Test
+    @Timeout(5)
+    void sendMessage_blockedInsideDeliverCollaborator_stillLetsShutdownProceedConcurrently() throws Exception {
+        CountDownLatch deliverEntered = new CountDownLatch(1);
+        CountDownLatch releaseDeliver = new CountDownLatch(1);
+        CancellableTelegramDeliverySender fake = new CancellableTelegramDeliverySender() {
+            @Override
+            public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+                deliverEntered.countDown();
+                awaitQuietly(releaseDeliver);
+                return CompletableFuture.completedFuture(null);
+            }
+
+            @Override
+            public void cancelAllPending() {
+            }
+        };
+
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("123"));
+        yaml.set("queue.shutdown-timeout-seconds", 0);
+        TelegramConfig config = new TelegramConfig(yaml);
+        client = new TelegramClient(config, Executors.newSingleThreadScheduledExecutor(), fake);
+
+        Thread sender = new Thread(() -> client.sendMessage("hello"));
+        sender.start();
+        assertThat(deliverEntered.await(4, TimeUnit.SECONDS)).isTrue();
+
+        CompletableFuture<Void> shutdownFuture = client.shutdown();
+        CompletableFuture<Void> rejected = client.sendMessage("too late");
+        assertThatThrownBy(() -> rejected.get(1, TimeUnit.SECONDS))
+                .cause().isInstanceOf(TelegramClientShuttingDownException.class);
+
+        releaseDeliver.countDown();
+        sender.join(4000);
+        shutdownFuture.get(4, TimeUnit.SECONDS);
+    }
+
+    @Test
+    @Timeout(5)
+    void deliver_callingClientShutdownSynchronously_doesNotDeadlock() throws Exception {
+        AtomicReference<CompletableFuture<Void>> shutdownResult = new AtomicReference<>();
+        CancellableTelegramDeliverySender fake = new CancellableTelegramDeliverySender() {
+            @Override
+            public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+                shutdownResult.set(client.shutdown());
+                return CompletableFuture.completedFuture(null);
+            }
+
+            @Override
+            public void cancelAllPending() {
+            }
+        };
+
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("123"));
+        yaml.set("queue.shutdown-timeout-seconds", 0);
+        TelegramConfig config = new TelegramConfig(yaml);
+        client = new TelegramClient(config, Executors.newSingleThreadScheduledExecutor(), fake);
+
+        client.sendMessage("hello").get(4, TimeUnit.SECONDS);
+
+        assertThat(shutdownResult.get()).isNotNull();
+        shutdownResult.get().get(4, TimeUnit.SECONDS);
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_secondCaller_cannotReturnBeforeAcceptanceTransitionCompletes_andBothShareOneFuture()
+            throws Exception {
+        startServer(attempt -> new StubResponse(200, "{\"ok\":true}"));
+
+        CountDownLatch pausedInTransition = new CountDownLatch(1);
+        CountDownLatch releaseTransition = new CountDownLatch(1);
+        client.setBeforeShutdownTransitionHookForTesting(() -> {
+            pausedInTransition.countDown();
+            awaitQuietly(releaseTransition);
+        });
+
+        AtomicReference<CompletableFuture<Void>> firstResult = new AtomicReference<>();
+        Thread firstCaller = new Thread(() -> firstResult.set(client.shutdown()));
+        firstCaller.start();
+        assertThat(pausedInTransition.await(4, TimeUnit.SECONDS)).isTrue();
+
+        CountDownLatch secondReturned = new CountDownLatch(1);
+        AtomicReference<CompletableFuture<Void>> secondResult = new AtomicReference<>();
+        Thread secondCaller = new Thread(() -> {
+            secondResult.set(client.shutdown());
+            secondReturned.countDown();
+        });
+        secondCaller.start();
+
+        while (!client.hasThreadsQueuedForLifecycleLockForTesting()) {
+            Thread.onSpinWait();
+        }
+        assertThat(secondReturned.getCount()).isEqualTo(1);
+
+        releaseTransition.countDown();
+        firstCaller.join(4000);
+        secondCaller.join(4000);
+
+        assertThat(secondResult.get()).isSameAs(firstResult.get());
+
+        CompletableFuture<Void> rejected = client.sendMessage("too late");
+        assertThatThrownBy(() -> rejected.get(1, TimeUnit.SECONDS))
+                .cause().isInstanceOf(TelegramClientShuttingDownException.class);
+
+        firstResult.get().get(4, TimeUnit.SECONDS);
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_blocksCompletionUntilSenderCancellationFinishes_andShutsDownSchedulerAfterward() throws Exception {
+        AtomicInteger cancelCalls = new AtomicInteger();
+        CountDownLatch cancelEntered = new CountDownLatch(1);
+        CountDownLatch releaseCancel = new CountDownLatch(1);
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        CancellableTelegramDeliverySender fake = new CancellableTelegramDeliverySender() {
+            @Override
+            public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            @Override
+            public void cancelAllPending() {
+                cancelCalls.incrementAndGet();
+                cancelEntered.countDown();
+                awaitQuietly(releaseCancel);
+            }
+        };
+
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("123"));
+        yaml.set("queue.shutdown-timeout-seconds", 0);
+        TelegramConfig config = new TelegramConfig(yaml);
+        client = new TelegramClient(config, scheduler, fake);
+
+        CompletableFuture<Void> shutdownFuture = client.shutdown();
+
+        assertThat(cancelEntered.await(4, TimeUnit.SECONDS)).isTrue();
+        assertThat(shutdownFuture).isNotDone();
+        assertThat(scheduler.isShutdown()).isFalse();
+
+        releaseCancel.countDown();
+        shutdownFuture.get(4, TimeUnit.SECONDS);
+
+        assertThat(cancelCalls.get()).isEqualTo(1);
+        assertThat(scheduler.awaitTermination(4, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_forced_resolvesQueuesAfterSenderCancellationCompletes() throws Exception {
+        CountDownLatch cancelEntered = new CountDownLatch(1);
+        CountDownLatch releaseCancel = new CountDownLatch(1);
+        CancellableTelegramDeliverySender fake = getFake(cancelEntered, releaseCancel);
+
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("1", "2"));
+        yaml.set("queue.shutdown-timeout-seconds", 0);
+        TelegramConfig config = new TelegramConfig(yaml);
+        client = new TelegramClient(config, Executors.newSingleThreadScheduledExecutor(), fake);
+
+        CompletableFuture<Void> broadcast = client.sendMessage("hello");
+        CompletableFuture<Void> shutdownFuture = client.shutdown();
+
+        assertThat(cancelEntered.await(4, TimeUnit.SECONDS)).isTrue();
+        assertThat(broadcast).isNotDone();
+        assertThat(shutdownFuture).isNotDone();
+
+        releaseCancel.countDown();
+        shutdownFuture.get(4, TimeUnit.SECONDS);
+
+        assertThat(broadcast).isCompletedExceptionally();
+        assertThat(client.aggregateQueueStatistics().depth()).isZero();
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_forcedByTimeout_stillTerminatesTheSchedulerAfterward() throws Exception {
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("123"));
+        yaml.set("queue.shutdown-timeout-seconds", 0);
+        TelegramConfig config = new TelegramConfig(yaml);
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        CompletableFuture<HttpResponse<String>> neverCompletes = new CompletableFuture<>();
+        TelegramApiTransport transport = new TelegramApiTransport(config, "http://unused", request -> neverCompletes);
+        client = new TelegramClient(config, scheduler, new RetryingTelegramSender(transport, scheduler));
+
+        client.sendMessage("hello");
+        client.shutdown().get(4, TimeUnit.SECONDS);
+
+        assertThat(scheduler.awaitTermination(4, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_withMaxValueTimeoutSeconds_neverThrowsAndCompletesOnGracefulDrain() throws Exception {
+        startServer(attempt -> new StubResponse(200, "{\"ok\":true}"));
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("123"));
+        yaml.set("queue.shutdown-timeout-seconds", Long.MAX_VALUE);
+        TelegramConfig config = new TelegramConfig(yaml);
+        client = new TelegramClient(config, "http://localhost:" + server.getAddress().getPort());
+
+        client.sendMessage("hello").get(4, TimeUnit.SECONDS);
+
+        client.shutdown().get(4, TimeUnit.SECONDS);
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdown_whenTimeoutSchedulingThrows_forcesShutdownImmediatelyAndStillCompletes() throws Exception {
+        CompletableFuture<Void> stuck = new CompletableFuture<>();
+        CancellableTelegramDeliverySender fake = new CancellableTelegramDeliverySender() {
+            @Override
+            public @NotNull CompletableFuture<Void> deliver(@NotNull String chatId, @NotNull String text) {
+                return stuck;
+            }
+
+            @Override
+            public void cancelAllPending() {
+                stuck.completeExceptionally(new CancellationException("delivery cancelled"));
+            }
+        };
+
+        FileConfiguration yaml = new YamlConfiguration();
+        yaml.set("client.token", "test-token");
+        yaml.set("client.chat-ids", List.of("123"));
+        TelegramConfig config = new TelegramConfig(yaml);
+        ThrowingOnScheduleScheduler scheduler = new ThrowingOnScheduleScheduler();
+        client = new TelegramClient(config, scheduler, fake);
+
+        CompletableFuture<Void> broadcast = client.sendMessage("hello");
+        CompletableFuture<Void> shutdownFuture = client.shutdown();
+
+        shutdownFuture.get(4, TimeUnit.SECONDS);
+        assertThatThrownBy(() -> broadcast.get(1, TimeUnit.SECONDS)).cause().isInstanceOf(CancellationException.class);
+
+        CompletableFuture<Void> repeated = client.shutdown();
+        assertThat(repeated).isSameAs(shutdownFuture);
+        repeated.get(1, TimeUnit.SECONDS);
     }
 
     @Test
@@ -584,5 +855,65 @@ class TelegramClientTest {
 
     private record StubResponse(int status, String body) {
 
+    }
+
+    private static final class ThrowingOnScheduleScheduler extends AbstractExecutorService
+            implements ScheduledExecutorService {
+
+        private final ScheduledExecutorService delegate = Executors.newSingleThreadScheduledExecutor();
+
+        @Override
+        public ScheduledFuture<?> schedule(@NotNull Runnable command, long delay, @NotNull TimeUnit unit) {
+            throw new RejectedExecutionException("simulated timeout scheduling failure");
+        }
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(@NotNull Callable<V> callable, long delay, @NotNull TimeUnit unit) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(
+                @NotNull Runnable command, long initialDelay, long period, @NotNull TimeUnit unit
+        ) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(
+                @NotNull Runnable command, long initialDelay, long delay, @NotNull TimeUnit unit
+        ) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void shutdown() {
+            delegate.shutdown();
+        }
+
+        @Override
+        public @NotNull List<Runnable> shutdownNow() {
+            return delegate.shutdownNow();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return delegate.isShutdown();
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return delegate.isTerminated();
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, @NotNull TimeUnit unit) throws InterruptedException {
+            return delegate.awaitTermination(timeout, unit);
+        }
+
+        @Override
+        public void execute(@NotNull Runnable command) {
+            delegate.execute(command);
+        }
     }
 }

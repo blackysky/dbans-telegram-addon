@@ -29,12 +29,22 @@ class ChatDeliveryQueueTest {
         return new ChatDeliveryQueue(CHAT_ID, capacity, QueueOverflowPolicy.DROP_NEWEST, sender);
     }
 
+    private static @NotNull CompletableFuture<Void> submitAndActivate(@NotNull ChatDeliveryQueue queue,
+                                                                      @NotNull String text
+    ) {
+        ChatDeliveryQueue.SubmitOutcome outcome = queue.submit(text);
+        if (outcome.shouldActivate()) {
+            queue.startNext();
+        }
+        return outcome.future();
+    }
+
     @Test
     void submit_belowCapacity_isAcceptedAndStartsDelivery() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(3, sender);
 
-        CompletableFuture<Void> result = queue.submit("a");
+        CompletableFuture<Void> result = submitAndActivate(queue, "a");
 
         assertThat(result).isNotDone();
         assertThat(sender.deliveredText).containsExactly("a");
@@ -42,12 +52,40 @@ class ChatDeliveryQueueTest {
     }
 
     @Test
+    void submit_doesNotStartDeliveryUntilCallerActivates() {
+        ControllableSender sender = new ControllableSender();
+        ChatDeliveryQueue queue = queue(3, sender);
+
+        ChatDeliveryQueue.SubmitOutcome outcome = queue.submit("a");
+
+        assertThat(outcome.shouldActivate()).isTrue();
+        assertThat(sender.deliveredText).isEmpty();
+        assertThat(outcome.future()).isNotDone();
+
+        queue.startNext();
+
+        assertThat(sender.deliveredText).containsExactly("a");
+    }
+
+    @Test
+    void submit_whileAnItemIsAlreadyActive_doesNotRequireActivation() {
+        ControllableSender sender = new ControllableSender();
+        ChatDeliveryQueue queue = queue(5, sender);
+        submitAndActivate(queue, "a");
+
+        ChatDeliveryQueue.SubmitOutcome second = queue.submit("b");
+
+        assertThat(second.shouldActivate()).isFalse();
+        assertThat(sender.deliveredText).containsExactly("a");
+    }
+
+    @Test
     void submit_upToCapacityBoundary_isAccepted() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(2, sender);
 
-        queue.submit("a");
-        queue.submit("b");
+        submitAndActivate(queue, "a");
+        submitAndActivate(queue, "b");
 
         assertThat(queue.statistics()).isEqualTo(new QueueStatistics(2, 2, 0));
         assertThat(sender.deliveredText).containsExactly("a");
@@ -57,10 +95,10 @@ class ChatDeliveryQueueTest {
     void submit_beyondCapacity_isRejectedWithDedicatedException() throws Exception {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(2, sender);
-        queue.submit("a");
-        queue.submit("b");
+        submitAndActivate(queue, "a");
+        submitAndActivate(queue, "b");
 
-        CompletableFuture<Void> rejected = queue.submit("c");
+        CompletableFuture<Void> rejected = submitAndActivate(queue, "c");
 
         assertThat(rejected).isCompletedExceptionally();
         assertThatThrownBy(rejected::get).cause().isInstanceOf(TelegramQueueFullException.class);
@@ -72,10 +110,10 @@ class ChatDeliveryQueueTest {
     void dropCounter_incrementsExactlyOncePerRejection() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(1, sender);
-        queue.submit("a");
+        submitAndActivate(queue, "a");
 
-        queue.submit("b");
-        queue.submit("c");
+        submitAndActivate(queue, "b");
+        submitAndActivate(queue, "c");
 
         assertThat(queue.statistics().dropped()).isEqualTo(2);
     }
@@ -84,8 +122,8 @@ class ChatDeliveryQueueTest {
     void depth_decreasesAsDeliveriesCompleteAndReachesZero() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(3, sender);
-        queue.submit("a");
-        queue.submit("b");
+        submitAndActivate(queue, "a");
+        submitAndActivate(queue, "b");
         assertThat(queue.statistics().depth()).isEqualTo(2);
 
         sender.futureFor(0).complete(null);
@@ -100,9 +138,9 @@ class ChatDeliveryQueueTest {
     void fifoOrder_isPreservedAcrossSeveralItems() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(5, sender);
-        queue.submit("a");
-        queue.submit("b");
-        queue.submit("c");
+        submitAndActivate(queue, "a");
+        submitAndActivate(queue, "b");
+        submitAndActivate(queue, "c");
 
         sender.futureFor(0).complete(null);
         sender.futureFor(1).complete(null);
@@ -115,8 +153,8 @@ class ChatDeliveryQueueTest {
     void failureOfOneItem_doesNotBlockTheNextItem() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(5, sender);
-        CompletableFuture<Void> first = queue.submit("a");
-        CompletableFuture<Void> second = queue.submit("b");
+        CompletableFuture<Void> first = submitAndActivate(queue, "a");
+        CompletableFuture<Void> second = submitAndActivate(queue, "b");
 
         sender.futureFor(0).completeExceptionally(new RuntimeException("boom"));
 
@@ -132,15 +170,15 @@ class ChatDeliveryQueueTest {
     void slowOrRetryingDelivery_doesNotConsumeExtraCapacity() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(1, sender);
-        CompletableFuture<Void> first = queue.submit("a");
+        CompletableFuture<Void> first = submitAndActivate(queue, "a");
 
-        assertThat(queue.submit("b")).isCompletedExceptionally();
+        assertThat(submitAndActivate(queue, "b")).isCompletedExceptionally();
         assertThat(queue.statistics().dropped()).isEqualTo(1);
 
         sender.futureFor(0).complete(null);
         assertThat(first).isCompletedWithValue(null);
 
-        CompletableFuture<Void> third = queue.submit("c");
+        CompletableFuture<Void> third = submitAndActivate(queue, "c");
         assertThat(third).isNotDone();
         assertThat(queue.statistics()).isEqualTo(new QueueStatistics(1, 1, 1));
     }
@@ -151,8 +189,8 @@ class ChatDeliveryQueueTest {
         ChatDeliveryQueue chatA = new ChatDeliveryQueue("a", 1, QueueOverflowPolicy.DROP_NEWEST, sender);
         ChatDeliveryQueue chatB = new ChatDeliveryQueue("b", 1, QueueOverflowPolicy.DROP_NEWEST, sender);
 
-        chatA.submit("stuck");
-        chatA.submit("dropped");
+        submitAndActivate(chatA, "stuck");
+        submitAndActivate(chatA, "dropped");
 
         assertThat(chatA.statistics().dropped()).isEqualTo(1);
         assertThat(chatB.statistics().dropped()).isEqualTo(0);
@@ -177,7 +215,7 @@ class ChatDeliveryQueueTest {
             pool.submit(() -> {
                 ready.countDown();
                 awaitQuietly(go);
-                results.add(queue.submit("msg-" + index));
+                results.add(submitAndActivate(queue, "msg-" + index));
             });
         }
         ready.await();
@@ -205,7 +243,7 @@ class ChatDeliveryQueueTest {
     void drain_waitsUntilQueueBecomesEmpty() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(5, sender);
-        queue.submit("a");
+        submitAndActivate(queue, "a");
 
         CompletableFuture<Void> drain = queue.drain();
         assertThat(drain).isNotDone();
@@ -220,7 +258,7 @@ class ChatDeliveryQueueTest {
         ChatDeliveryQueue queue = queue(5, sender);
         queue.stopAccepting();
 
-        CompletableFuture<Void> result = queue.submit("a");
+        CompletableFuture<Void> result = submitAndActivate(queue, "a");
 
         assertThat(result).isCompletedExceptionally();
         assertThatThrownBy(result::get).cause().isInstanceOf(TelegramClientShuttingDownException.class);
@@ -232,8 +270,8 @@ class ChatDeliveryQueueTest {
     void forceCancel_completesRemainingItemsAndDrainWaiters() throws Exception {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(5, sender);
-        CompletableFuture<Void> first = queue.submit("a");
-        CompletableFuture<Void> second = queue.submit("b");
+        CompletableFuture<Void> first = submitAndActivate(queue, "a");
+        CompletableFuture<Void> second = submitAndActivate(queue, "b");
         CompletableFuture<Void> drain = queue.drain();
 
         int cancelled = queue.forceCancel();
@@ -272,7 +310,7 @@ class ChatDeliveryQueueTest {
         ChatDeliveryQueue queue = queue(5, sender);
         queue.setBeforeInvokeDeliverHookForTesting(queue::forceCancel);
 
-        CompletableFuture<Void> result = queue.submit("a");
+        CompletableFuture<Void> result = submitAndActivate(queue, "a");
 
         assertThat(sender.deliveredText).isEmpty();
         assertThat(result).isCompletedExceptionally();
@@ -284,8 +322,8 @@ class ChatDeliveryQueueTest {
     void staleDeliveryCallback_afterForcedCancellation_doesNotCorruptQueueState() {
         ControllableSender sender = new ControllableSender();
         ChatDeliveryQueue queue = queue(5, sender);
-        CompletableFuture<Void> first = queue.submit("a");
-        CompletableFuture<Void> second = queue.submit("b");
+        CompletableFuture<Void> first = submitAndActivate(queue, "a");
+        CompletableFuture<Void> second = submitAndActivate(queue, "b");
 
         queue.forceCancel();
         sender.futureFor(0).complete(null);
@@ -302,11 +340,11 @@ class ChatDeliveryQueueTest {
         ThrowingThenPendingSender sender = new ThrowingThenPendingSender();
         ChatDeliveryQueue queue = new ChatDeliveryQueue(CHAT_ID, 5, QueueOverflowPolicy.DROP_NEWEST, sender);
 
-        CompletableFuture<Void> first = queue.submit("a");
+        CompletableFuture<Void> first = submitAndActivate(queue, "a");
         assertThat(first).isCompletedExceptionally();
         assertThatThrownBy(first::get).cause().isInstanceOf(RuntimeException.class).hasMessage("synchronous boom");
 
-        CompletableFuture<Void> second = queue.submit("b");
+        CompletableFuture<Void> second = submitAndActivate(queue, "b");
         CompletableFuture<Void> drain = queue.drain();
         assertThat(second).isNotDone();
         assertThat(drain).isNotDone();

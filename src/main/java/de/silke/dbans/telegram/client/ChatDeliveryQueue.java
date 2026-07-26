@@ -27,10 +27,6 @@ final class ChatDeliveryQueue {
     private QueueState state = QueueState.ACCEPTING;
     private QueueItem activeItem;
 
-    /**
-     * Used after delivery attempt was selected, but
-     * before the sender is invoked.
-     */
     @TestOnly
     private volatile Runnable beforeInvokeDeliverHookForTesting = () -> {
     };
@@ -53,11 +49,12 @@ final class ChatDeliveryQueue {
                 "Telegram chat queue is shutting down and no longer accepts messages");
     }
 
-    @NotNull CompletableFuture<Void> submit(@NotNull String text) {
+    @Contract("_ -> new")
+    @NotNull SubmitOutcome submit(@NotNull String text) {
         Objects.requireNonNull(text, "text");
         CompletableFuture<Void> future = new CompletableFuture<>();
         Throwable rejection = null;
-        boolean startNow = false;
+        boolean shouldActivate = false;
 
         synchronized (lock) {
             if (state != QueueState.ACCEPTING) {
@@ -67,16 +64,15 @@ final class ChatDeliveryQueue {
                 rejection = overflowFailure();
             } else {
                 items.add(new QueueItem(text, future));
-                startNow = items.size() == 1;
+                shouldActivate = items.size() == 1;
             }
         }
 
         if (rejection != null) {
             future.completeExceptionally(rejection);
-        } else if (startNow) {
-            startNext();
+            return new SubmitOutcome(future, false);
         }
-        return future;
+        return new SubmitOutcome(future, shouldActivate);
     }
 
     private @NotNull TelegramQueueFullException overflowFailure() {
@@ -85,7 +81,7 @@ final class ChatDeliveryQueue {
         };
     }
 
-    private void startNext() {
+    void startNext() {
         QueueItem head;
         synchronized (lock) {
             if (state == QueueState.FORCIBLY_STOPPED) {
@@ -215,6 +211,10 @@ final class ChatDeliveryQueue {
     }
 
     private record QueueItem(@NotNull String text, @NotNull CompletableFuture<Void> future) {
+
+    }
+
+    record SubmitOutcome(@NotNull CompletableFuture<Void> future, boolean shouldActivate) {
 
     }
 }
