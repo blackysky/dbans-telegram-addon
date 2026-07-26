@@ -72,7 +72,7 @@ public class AddonController {
             } else {
                 snapshot = Snapshot.inactive();
                 log.warning("Telegram integration is inactive (" + String.join("; ", result.errors()) + "). "
-                            + "Fill in the configuration and use /dbanstelegram reload to activate it");
+                            + "Fill in the configuration and use \"/dbanstelegram reload\" to activate it");
             }
         }
     }
@@ -138,7 +138,7 @@ public class AddonController {
         AddonRuntime runtime = current.runtime();
         if (current.state() != AddonState.ACTIVE || runtime == null) {
             sender.sendMessage("Telegram integration is not configured. " +
-                               "Fill in the configuration and use /dbanstelegram reload to activate it");
+                               "Fill in the configuration and use \"/dbanstelegram reload\" to activate it");
             return;
         }
 
@@ -148,7 +148,7 @@ public class AddonController {
             sender.sendMessage("Sending test message...");
         }
 
-        runtime.sendTestMessage("[TEST] By " + sender.getName())
+        runtime.sendTestMessage("This is a test message sent by " + sender.getName())
                .whenComplete((ignored, throwable) -> {
                    if (snapshot.state() == AddonState.STOPPED) {
                        return;
@@ -162,7 +162,7 @@ public class AddonController {
                            }
                        });
                    } catch (IllegalPluginAccessException e) {
-                       log.warning("Could not deliver test message result; the plugin is disabling");
+                       log.warning("Could not deliver test message result. Plugin is disabling");
                    }
                });
     }
@@ -233,5 +233,4 @@ public class AddonController {
         }
 
     }
-
 }

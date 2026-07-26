@@ -306,7 +306,7 @@ class AddonControllerTest {
 
         controller.test(sender);
 
-        verify(runtime).sendTestMessage("[TEST] By Admin");
+        verify(runtime).sendTestMessage("This is a test message sent by Admin");
     }
 
     @Test
@@ -377,5 +377,4 @@ class AddonControllerTest {
 
         sendResult.complete(null);
     }
-
 }
