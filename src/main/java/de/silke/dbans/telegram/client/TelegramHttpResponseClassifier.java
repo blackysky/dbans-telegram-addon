@@ -14,6 +14,7 @@ final class TelegramHttpResponseClassifier {
 
     private static final Set<Integer> RETRYABLE_STATUS_CODES = Set.of(500, 502, 503, 504);
     private static final int DEFAULT_RETRY_AFTER_SECONDS = 30;
+    private static final int MAX_RETRY_AFTER_SECONDS = 3600;
 
     @Contract("_, _ -> new")
     static @NotNull Result classify(int statusCode, @NotNull String body) {
@@ -36,12 +37,20 @@ final class TelegramHttpResponseClassifier {
             if (params != null) {
                 JsonElement retryAfter = params.get("retry_after");
                 if (retryAfter != null) {
-                    return retryAfter.getAsInt();
+                    return clampRetryAfter(retryAfter.getAsInt());
                 }
             }
         } catch (RuntimeException ignored) {
         }
         return DEFAULT_RETRY_AFTER_SECONDS;
+    }
+
+    @Contract(pure = true)
+    private static int clampRetryAfter(int seconds) {
+        if (seconds < 0) {
+            return DEFAULT_RETRY_AFTER_SECONDS;
+        }
+        return Math.min(seconds, MAX_RETRY_AFTER_SECONDS);
     }
 
     enum Classification {
