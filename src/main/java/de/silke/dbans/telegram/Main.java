@@ -17,12 +17,7 @@ public final class Main extends JavaPlugin {
     @Override
     public void onEnable() {
         saveDefaultConfig();
-        for (SupportedLocale locale : SupportedLocale.values()) {
-            String path = "locale/" + locale.getCode() + ".yml";
-            if (!new File(getDataFolder(), path).exists()) {
-                saveResource(path, false);
-            }
-        }
+        createSupportedLocales();
 
         controller = new AddonController(this, new AddonRuntimeFactory(this));
         getServer().getPluginManager().registerEvents(new PunishmentEventListener(controller), this);
@@ -32,11 +27,19 @@ public final class Main extends JavaPlugin {
         controller.start(getConfig());
     }
 
+    private void createSupportedLocales() {
+        for (SupportedLocale locale : SupportedLocale.values()) {
+            String path = "locale/" + locale.getCode() + ".yml";
+            if (!new File(getDataFolder(), path).exists()) {
+                saveResource(path, false);
+            }
+        }
+    }
+
     @Override
     public void onDisable() {
         if (controller != null) {
             controller.stop();
         }
     }
-
 }
