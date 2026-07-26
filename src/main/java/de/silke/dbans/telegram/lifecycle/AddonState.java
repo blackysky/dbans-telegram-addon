@@ -5,5 +5,4 @@ public enum AddonState {
     INACTIVE,
     ACTIVE,
     STOPPED
-
 }

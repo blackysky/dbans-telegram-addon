@@ -101,5 +101,4 @@ public class AddonRuntimeFactory {
             return runtime != null;
         }
     }
-
 }
