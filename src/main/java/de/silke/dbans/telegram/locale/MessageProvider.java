@@ -40,11 +40,11 @@ public class MessageProvider {
                 : loadFromStream(plugin.getResource(resourcePath), resourcePath);
     }
 
-    @SuppressWarnings("MethodWithMultipleReturnPoints")
     @Nullable
     private static YamlConfiguration loadFromStream(@Nullable InputStream stream, @NotNull String path) {
         if (stream == null) {
-            log.severe("Locale file not found: " + path + ". Falling back to empty templates");
+            log.severe("Locale file not found: " + path + ". " +
+                       "Falling back to empty templates for this locale");
             return null;
         }
         try (InputStreamReader reader = new InputStreamReader(stream, StandardCharsets.UTF_8)) {

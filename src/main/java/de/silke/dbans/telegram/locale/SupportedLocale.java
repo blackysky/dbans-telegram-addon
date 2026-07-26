@@ -24,7 +24,7 @@ public enum SupportedLocale {
                 return locale;
             }
         }
-        log.warning("Unknown locale '" + code + "', falling back to EN.");
+        log.warning("Unknown locale '" + code + "', falling back to EN");
         return EN;
     }
 }
