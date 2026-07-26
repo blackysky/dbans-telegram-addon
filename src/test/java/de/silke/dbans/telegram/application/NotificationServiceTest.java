@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.io.File;
+import java.io.IOException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.Optional;
@@ -169,7 +170,7 @@ class NotificationServiceTest {
     @Test
     void isLifecycleCancellation_classifiesRealDeliveryFailuresAsNotLifecycle() {
         assertThat(NotificationService.isLifecycleCancellation(new RuntimeException("boom"))).isFalse();
-        assertThat(NotificationService.isLifecycleCancellation(new java.io.IOException("network down"))).isFalse();
+        assertThat(NotificationService.isLifecycleCancellation(new IOException("network down"))).isFalse();
     }
 
     @Test

@@ -2,6 +2,8 @@ package de.silke.dbans.telegram.client;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.CancellationException;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -35,6 +37,6 @@ class TelegramQueueFullExceptionTest {
         TelegramQueueFullException exception = new TelegramQueueFullException("123", 5);
 
         assertThat(exception).isNotInstanceOf(TelegramClientShuttingDownException.class);
-        assertThat(exception).isNotInstanceOf(java.util.concurrent.CancellationException.class);
+        assertThat(exception).isNotInstanceOf(CancellationException.class);
     }
 }
