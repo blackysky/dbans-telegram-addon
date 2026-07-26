@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import javax.net.ssl.SSLSession;
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
@@ -16,6 +17,7 @@ import java.net.http.HttpResponse;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -23,6 +25,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class RetryingTelegramSenderTest {
 
     private static final String CHAT_ID = "chat-1";
+
+    private static void awaitQuietly(@NotNull CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
 
     private static @NotNull HttpResponse<String> fakeResponse(int status, @NotNull String body) {
         return new HttpResponse<>() {
@@ -174,24 +184,148 @@ class RetryingTelegramSenderTest {
 
     @Test
     @Timeout(5)
-    void deliver_synchronousTransportFailure_neverThrowsAndEventuallyFailsAfterRetriesExhaust() {
+    void deliver_requestPreparationFailure_failsImmediatelyWithoutRetrying() {
+        AtomicInteger httpCalls = new AtomicInteger();
         ManualScheduler scheduler = new ManualScheduler();
         RetryingTelegramSender sender = new RetryingTelegramSender(
                 new TelegramApiTransport(config(), "http://unused", request -> {
+                    httpCalls.incrementAndGet();
                     throw new IllegalArgumentException("malformed request");
                 }),
                 scheduler
         );
 
         CompletableFuture<Void> result = sender.deliver(CHAT_ID, "hello");
-        assertThat(result).isNotDone();
 
-        for (int i = 0; i < 6; i++) {
-            scheduler.fireAll();
-        }
+        assertThat(result).isNotDone();
+        assertThat(scheduler.pendingTaskCount()).isEqualTo(1);
+        scheduler.fireAll();
 
         assertThat(result).isCompletedExceptionally();
-        assertThatThrownBy(result::get).cause().isInstanceOf(IllegalArgumentException.class).hasMessage("malformed request");
+        assertThatThrownBy(result::get)
+                .cause().isInstanceOf(TelegramRequestPreparationException.class)
+                .cause().isInstanceOf(IllegalArgumentException.class).hasMessage("malformed request");
+        assertThat(httpCalls.get()).isEqualTo(1);
+        assertThat(scheduler.pendingTaskCount()).isZero();
+    }
+
+    @Test
+    @Timeout(5)
+    void deliver_networkFailure_isRetriedRatherThanFailedImmediately() {
+        AtomicInteger httpCalls = new AtomicInteger();
+        ManualScheduler scheduler = new ManualScheduler();
+        RetryingTelegramSender sender = new RetryingTelegramSender(
+                new TelegramApiTransport(config(), "http://unused", request -> {
+                    httpCalls.incrementAndGet();
+                    return CompletableFuture.failedFuture(new IOException("network blip"));
+                }),
+                scheduler
+        );
+
+        CompletableFuture<Void> result = sender.deliver(CHAT_ID, "hello");
+
+        assertThat(result).isNotDone();
+        assertThat(httpCalls.get()).isEqualTo(1);
+        assertThat(scheduler.pendingTaskCount()).isEqualTo(1);
+
+        scheduler.fireAll();
+        assertThat(httpCalls.get()).isEqualTo(2);
+        sender.cancelAllPending();
+    }
+
+    @Test
+    @Timeout(5)
+    void deliver_cancellationSurfacedByTransport_isNotMistakenForANetworkFailure() {
+        AtomicInteger httpCalls = new AtomicInteger();
+        ManualScheduler scheduler = new ManualScheduler();
+        RetryingTelegramSender sender = new RetryingTelegramSender(
+                new TelegramApiTransport(config(), "http://unused", request -> {
+                    httpCalls.incrementAndGet();
+                    return CompletableFuture.failedFuture(new CancellationException("cancelled downstream"));
+                }),
+                scheduler
+        );
+
+        CompletableFuture<Void> result = sender.deliver(CHAT_ID, "hello");
+
+        assertThat(result).isNotDone();
+        scheduler.fireAll();
+
+        assertThat(result).isCompletedExceptionally();
+        assertThatThrownBy(result::get).cause().isInstanceOf(CancellationException.class);
+        assertThat(httpCalls.get()).isEqualTo(1);
+        assertThat(scheduler.pendingTaskCount()).isZero();
+    }
+
+    @Test
+    @Timeout(5)
+    void deliver_pausedAfterCancellationCheckButBeforeTransportInvocation_neverReachesHttpOnceCancelled()
+            throws Exception {
+        AtomicInteger httpCalls = new AtomicInteger();
+        ManualScheduler scheduler = new ManualScheduler();
+        RetryingTelegramSender sender = new RetryingTelegramSender(
+                new TelegramApiTransport(config(), "http://unused", request -> {
+                    httpCalls.incrementAndGet();
+                    return CompletableFuture.completedFuture(fakeResponse(200, "{\"ok\":true}"));
+                }),
+                scheduler
+        );
+
+        CountDownLatch paused = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        sender.setBeforeTransportAttemptHookForTesting(() -> {
+            paused.countDown();
+            awaitQuietly(resume);
+        });
+
+        AtomicReference<CompletableFuture<Void>> result = new AtomicReference<>();
+        Thread delivering = new Thread(() -> result.set(sender.deliver(CHAT_ID, "hello")));
+        delivering.start();
+
+        assertThat(paused.await(2, TimeUnit.SECONDS)).isTrue();
+        sender.cancelAllPending();
+        resume.countDown();
+        delivering.join(2000);
+
+        assertThat(httpCalls.get()).isZero();
+        assertThatThrownBy(() -> result.get().get(2, TimeUnit.SECONDS)).cause().isInstanceOf(CancellationException.class);
+    }
+
+    @Test
+    @Timeout(5)
+    void scheduledRetry_pausedAfterCancellationCheckButBeforeTransportInvocation_neverStartsANewHttpCall()
+            throws Exception {
+        AtomicInteger httpCalls = new AtomicInteger();
+        ManualScheduler scheduler = new ManualScheduler();
+        RetryingTelegramSender sender = new RetryingTelegramSender(
+                new TelegramApiTransport(config(), "http://unused", request -> {
+                    httpCalls.incrementAndGet();
+                    return CompletableFuture.completedFuture(fakeResponse(503, "{\"ok\":false}"));
+                }),
+                scheduler
+        );
+
+        CompletableFuture<Void> result = sender.deliver(CHAT_ID, "hello");
+        assertThat(httpCalls.get()).isEqualTo(1);
+        assertThat(scheduler.pendingTaskCount()).isEqualTo(1);
+
+        CountDownLatch paused = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        sender.setBeforeTransportAttemptHookForTesting(() -> {
+            paused.countDown();
+            awaitQuietly(resume);
+        });
+
+        Thread firingScheduledRetry = new Thread(scheduler::fireAll);
+        firingScheduledRetry.start();
+
+        assertThat(paused.await(2, TimeUnit.SECONDS)).isTrue();
+        sender.cancelAllPending();
+        resume.countDown();
+        firingScheduledRetry.join(2000);
+
+        assertThat(httpCalls.get()).isEqualTo(1);
+        assertThatThrownBy(() -> result.get(2, TimeUnit.SECONDS)).cause().isInstanceOf(CancellationException.class);
     }
 
     private static final class ManualScheduler extends AbstractExecutorService implements ScheduledExecutorService {

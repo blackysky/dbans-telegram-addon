@@ -27,6 +27,10 @@ final class RetryingTelegramSender implements CancellableTelegramDeliverySender 
     private final Map<CompletableFuture<?>, ScheduledFuture<?>> pendingScheduled = new HashMap<>();
     private boolean cancelled = false;
 
+    @TestOnly
+    private volatile Runnable beforeTransportAttemptHookForTesting = () -> {
+    };
+
     RetryingTelegramSender(@NotNull TelegramApiTransport transport,
                            @NotNull ScheduledExecutorService scheduler
     ) {
@@ -67,7 +71,7 @@ final class RetryingTelegramSender implements CancellableTelegramDeliverySender 
     }
 
     private @NotNull CompletableFuture<Void> pacedSend(@NotNull String chatId, @NotNull String text) {
-        return sendMessage(chatId, text, 0)
+        return attemptTransportSend(chatId, text, 0)
                 .handle((v, ex) -> ex)
                 .thenCompose(ex -> delay().thenCompose(v -> ex == null
                         ? CompletableFuture.completedFuture(null)
@@ -127,24 +131,46 @@ final class RetryingTelegramSender implements CancellableTelegramDeliverySender 
         }
     }
 
-    private @NotNull CompletableFuture<Void> sendMessage(@NotNull String chatId, @NotNull String text, int attempt) {
-        CompletableFuture<HttpResponse<String>> responseFuture;
-        try {
-            responseFuture = transport.send(chatId, text);
-        } catch (RuntimeException e) {
-            return CompletableFuture.failedFuture(e);
+    @Contract(mutates = "this")
+    @TestOnly
+    void setBeforeTransportAttemptHookForTesting(@NotNull Runnable hook) {
+        this.beforeTransportAttemptHookForTesting = Objects.requireNonNull(hook, "hook");
+    }
+
+    private @NotNull CompletableFuture<Void> attemptTransportSend(@NotNull String chatId, @NotNull String text,
+                                                                  int attempt
+    ) {
+        synchronized (lock) {
+            if (cancelled) {
+                return CompletableFuture.failedFuture(cancellationException());
+            }
         }
+        beforeTransportAttemptHookForTesting.run();
+        synchronized (lock) {
+            if (cancelled) {
+                return CompletableFuture.failedFuture(cancellationException());
+            }
+        }
+        CompletableFuture<HttpResponse<String>> responseFuture = transport.send(chatId, text);
         return responseFuture.handle((response, ex) -> ex != null
-                                     ? retryOnNetworkError(chatId, text, attempt, ex)
+                                     ? handleFailure(chatId, text, attempt, ex)
                                      : handleResponse(chatId, text, response, attempt))
                              .thenCompose(future -> future);
+    }
+
+    private @NotNull CompletableFuture<Void> handleFailure(
+            @NotNull String chatId, @NotNull String text, int attempt, @NotNull Throwable ex
+    ) {
+        if (ex instanceof TelegramRequestPreparationException || ex instanceof CancellationException) {
+            return CompletableFuture.failedFuture(ex);
+        }
+        return retryOnNetworkError(chatId, text, attempt, ex);
     }
 
     private @NotNull CompletableFuture<Void> retryOnNetworkError(
             @NotNull String chatId, @NotNull String text, int attempt, @NotNull Throwable ex
     ) {
         if (attempt >= MAX_RETRIES) {
-            log.log(Level.SEVERE, "Failed to send Telegram message to " + chatId + " after " + MAX_RETRIES + " retries", ex);
             return CompletableFuture.failedFuture(ex);
         }
         log.log(Level.WARNING, "Failed to send Telegram message to " + chatId
@@ -160,7 +186,7 @@ final class RetryingTelegramSender implements CancellableTelegramDeliverySender 
             case SUCCESS -> CompletableFuture.completedFuture(null);
             case RATE_LIMITED -> handleRateLimited(chatId, text, attempt, result);
             case TEMPORARY_FAILURE -> handleTemporaryFailure(chatId, text, attempt, result);
-            case PERMANENT_FAILURE -> handlePermanentFailure(chatId, result, response.body());
+            case PERMANENT_FAILURE -> CompletableFuture.failedFuture(new TelegramApiException(result.statusCode()));
         };
     }
 
@@ -169,7 +195,6 @@ final class RetryingTelegramSender implements CancellableTelegramDeliverySender 
             @NotNull TelegramHttpResponseClassifier.Result result
     ) {
         if (attempt >= MAX_RETRIES) {
-            log.warning("Telegram rate limit hit. Message to " + chatId + " dropped after " + MAX_RETRIES + " retries");
             return CompletableFuture.failedFuture(new TelegramApiException(result.statusCode()));
         }
         int retryAfter = result.retryAfterSeconds();
@@ -183,8 +208,6 @@ final class RetryingTelegramSender implements CancellableTelegramDeliverySender 
             @NotNull TelegramHttpResponseClassifier.Result result
     ) {
         if (attempt >= MAX_RETRIES) {
-            log.warning("Telegram server error " + result.statusCode() + ". Message to " + chatId
-                        + " dropped after " + MAX_RETRIES + " retries");
             return CompletableFuture.failedFuture(new TelegramApiException(result.statusCode()));
         }
         log.warning("Telegram server error " + result.statusCode() + " for " + chatId + ". Retrying "
@@ -192,18 +215,11 @@ final class RetryingTelegramSender implements CancellableTelegramDeliverySender 
         return scheduleRetry(chatId, text, attempt, MIN_SEND_INTERVAL.toSeconds());
     }
 
-    private @NotNull CompletableFuture<Void> handlePermanentFailure(
-            @NotNull String chatId, @NotNull TelegramHttpResponseClassifier.Result result, @NotNull String body
-    ) {
-        log.warning("Telegram API returned unexpected status " + result.statusCode() + " for " + chatId + ": " + body);
-        return CompletableFuture.failedFuture(new TelegramApiException(result.statusCode()));
-    }
-
     private @NotNull CompletableFuture<Void> scheduleRetry(
             @NotNull String chatId, @NotNull String text, int attempt, long delaySeconds
     ) {
         return scheduleDelayed(delaySeconds, TimeUnit.SECONDS, future ->
-                sendMessage(chatId, text, attempt + 1)
+                attemptTransportSend(chatId, text, attempt + 1)
                         .whenComplete((v, ex) -> {
                             if (ex != null) {
                                 future.completeExceptionally(ex);

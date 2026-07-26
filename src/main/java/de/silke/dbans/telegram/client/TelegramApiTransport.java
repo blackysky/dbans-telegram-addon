@@ -41,25 +41,37 @@ final class TelegramApiTransport {
     }
 
     @NotNull CompletableFuture<HttpResponse<String>> send(@NotNull String chatId, @NotNull String text) {
+        Objects.requireNonNull(chatId, "chatId");
+        Objects.requireNonNull(text, "text");
         try {
             HttpRequest request = buildRequest(chatId, text);
             return httpSender.send(request);
         } catch (RuntimeException e) {
-            return CompletableFuture.failedFuture(e);
+            return CompletableFuture.failedFuture(
+                    new TelegramRequestPreparationException("Failed to prepare the Telegram API request", e)
+            );
         }
     }
 
     private @NotNull HttpRequest buildRequest(@NotNull String chatId, @NotNull String text) {
-        String url = apiBaseUrl + "/bot" + config.getToken() + "/sendMessage";
         String body = "chat_id=" + URLEncoder.encode(chatId, StandardCharsets.UTF_8)
                       + "&text=" + URLEncoder.encode(text, StandardCharsets.UTF_8);
 
         return HttpRequest.newBuilder()
-                          .uri(URI.create(url))
+                          .uri(buildUri())
                           .header("Content-Type", "application/x-www-form-urlencoded")
                           .timeout(Duration.ofSeconds(10))
                           .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                           .build();
+    }
+
+    private @NotNull URI buildUri() {
+        String url = apiBaseUrl + "/bot" + config.getToken() + "/sendMessage";
+        try {
+            return URI.create(url);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Telegram API base URL or token produced an invalid request URI");
+        }
     }
 
     @UtilityClass
